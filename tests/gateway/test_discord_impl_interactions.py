@@ -255,6 +255,7 @@ def test_register_slash_commands_registers_expected_names():
         "help",
         "commands",
         "whoami",
+        "id",
         "model",
         "models",
         "reasoning",

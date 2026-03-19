@@ -1,0 +1,406 @@
+"""Discord-native runtime status, help, command, and identity renderers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
+
+from gateway.platforms.base import MessageEvent
+from gateway.session import SessionSource
+from hermes_cli.commands import (
+    CommandDef,
+    format_gateway_command_signature,
+    gateway_command_defs,
+    gateway_commands_by_category,
+)
+from hermes_cli.models import provider_label
+
+
+@dataclass(frozen=True)
+class DiscordStatusSnapshot:
+    session_id: str
+    session_key: str
+    created_at: datetime
+    updated_at: datetime
+    source: SessionSource
+    target_source: SessionSource
+    configured_model: str
+    configured_provider: str
+    active_model: str
+    active_provider: str
+    is_fallback: bool
+    runtime_provider: str
+    api_mode: str
+    base_url: str
+    credentials_configured: bool
+    credential_source: Optional[str]
+    transport_command: Optional[str]
+    runtime_error: Optional[str]
+    context_length: Optional[int]
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    total_tokens: int
+    last_prompt_tokens: int
+    estimated_cost_usd: float
+    cost_status: str
+    is_running: bool
+    has_pending_message: bool
+    has_pending_approval: bool
+    approval_command_preview: Optional[str]
+    has_background_process: bool
+    voice_mode: str
+    connected_platforms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DiscordWhoamiSnapshot:
+    source: SessionSource
+    target_source: SessionSource
+    session_key: str
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _short_id(value: str, limit: int = 12) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def _yes_no(value: bool, yes: str = "Yes", no: str = "No") -> str:
+    return yes if value else no
+
+
+def _alias_note(cmd: CommandDef) -> str:
+    visible_aliases = [
+        f"`/{alias}`"
+        for alias in cmd.aliases
+        if alias.replace("-", "_") != cmd.name.replace("-", "_")
+    ]
+    if not visible_aliases:
+        return ""
+    return f" (alias: {', '.join(visible_aliases)})"
+
+
+def _command_lookup() -> dict[str, CommandDef]:
+    return {cmd.name: cmd for cmd in gateway_command_defs()}
+
+
+def _load_skill_commands() -> dict[str, str]:
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        skill_cmds = get_skill_commands()
+    except Exception:
+        return {}
+
+    result: dict[str, str] = {}
+    for name, payload in sorted(skill_cmds.items()):
+        result[name] = str(payload.get("description") or "Skill command")
+    return result
+
+
+def _resolve_target_source(event: MessageEvent, session_source: SessionSource) -> SessionSource:
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict):
+        target = metadata.get("command_target_source")
+        if isinstance(target, SessionSource):
+            return target
+    return event.source if isinstance(event.source, SessionSource) else session_source
+
+
+def _resolve_context_length(active_model: str, runtime: dict[str, Any]) -> Optional[int]:
+    if not active_model:
+        return None
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        return get_model_context_length(
+            active_model,
+            base_url=str(runtime.get("base_url") or ""),
+            api_key=str(runtime.get("api_key") or ""),
+        )
+    except Exception:
+        return None
+
+
+def collect_discord_status_snapshot(runner: Any, event: MessageEvent) -> DiscordStatusSnapshot:
+    """Collect Discord-native status data without rendering concerns."""
+    session_source = runner._session_source_for_event(event)
+    target_source = _resolve_target_source(event, session_source)
+    session_entry = runner.session_store.get_or_create_session(session_source)
+    session_key = runner._session_key_for_source(session_source)
+    state = runner._load_current_model_selection()
+    configured_model = str(state.get("current_model") or "")
+    configured_provider = str(state.get("current_provider") or "openrouter")
+    active_model = str(getattr(runner, "_effective_model", None) or configured_model)
+    active_provider = str(getattr(runner, "_effective_provider", None) or configured_provider)
+    is_fallback = bool(getattr(runner, "_effective_model", None))
+
+    runtime_requested = active_provider or configured_provider
+    runtime, runtime_error = runner._resolve_model_runtime_details(runtime_requested)
+    runtime_provider = str(runtime.get("provider") or runtime_requested)
+    api_mode = str(runtime.get("api_mode") or "unknown")
+    base_url = str(runtime.get("base_url") or "unknown")
+    transport_command = str(runtime.get("command") or "").strip() or None
+    credential_source = str(runtime.get("source") or "").strip() or None
+    credentials_configured = bool(str(runtime.get("api_key") or "").strip() or transport_command)
+    context_length = _resolve_context_length(active_model, runtime)
+
+    try:
+        from tools.process_registry import process_registry
+
+        has_background_process = process_registry.has_active_for_session(session_key)
+    except Exception:
+        has_background_process = False
+
+    pending_approval = getattr(runner, "_pending_approvals", {}).get(session_key)
+    approval_command_preview = None
+    if isinstance(pending_approval, dict):
+        approval_command = str(pending_approval.get("command") or "").strip()
+        if approval_command:
+            approval_command_preview = approval_command[:80]
+            if len(approval_command) > 80:
+                approval_command_preview += "..."
+
+    connected_platforms = tuple(sorted(platform.value for platform in getattr(runner, "adapters", {}).keys()))
+
+    return DiscordStatusSnapshot(
+        session_id=session_entry.session_id,
+        session_key=session_key,
+        created_at=session_entry.created_at,
+        updated_at=session_entry.updated_at,
+        source=session_source,
+        target_source=target_source,
+        configured_model=configured_model,
+        configured_provider=configured_provider,
+        active_model=active_model,
+        active_provider=active_provider,
+        is_fallback=is_fallback,
+        runtime_provider=runtime_provider,
+        api_mode=api_mode,
+        base_url=base_url,
+        credentials_configured=credentials_configured,
+        credential_source=credential_source,
+        transport_command=transport_command,
+        runtime_error=runtime_error,
+        context_length=context_length,
+        input_tokens=session_entry.input_tokens,
+        output_tokens=session_entry.output_tokens,
+        cache_read_tokens=session_entry.cache_read_tokens,
+        cache_write_tokens=session_entry.cache_write_tokens,
+        total_tokens=session_entry.total_tokens,
+        last_prompt_tokens=session_entry.last_prompt_tokens,
+        estimated_cost_usd=session_entry.estimated_cost_usd,
+        cost_status=session_entry.cost_status,
+        is_running=session_key in getattr(runner, "_running_agents", {}),
+        has_pending_message=bool(getattr(runner, "_pending_messages", {}).get(session_key)),
+        has_pending_approval=bool(pending_approval),
+        approval_command_preview=approval_command_preview,
+        has_background_process=has_background_process,
+        voice_mode=getattr(runner, "_voice_mode", {}).get(target_source.chat_id, "off"),
+        connected_platforms=connected_platforms,
+    )
+
+
+def render_discord_status(snapshot: DiscordStatusSnapshot) -> str:
+    """Render Discord status output in a multi-section, chat-readable format."""
+    lines = [
+        "📊 **Hermes Status**",
+        "",
+        "**Session**",
+        f"• Session ID: `{_short_id(snapshot.session_id)}`",
+        f"• Session Key: `{_short_id(snapshot.session_key, limit=18)}`",
+        f"• Created: {_format_timestamp(snapshot.created_at)}",
+        f"• Last Activity: {_format_timestamp(snapshot.updated_at)}",
+        f"• Chat: {snapshot.target_source.chat_name or snapshot.target_source.chat_id}",
+        f"• Chat Type: `{snapshot.target_source.chat_type}`",
+    ]
+    if snapshot.target_source.thread_id:
+        lines.append(f"• Thread ID: `{snapshot.target_source.thread_id}`")
+    if snapshot.target_source.chat_topic:
+        lines.append(f"• Chat Topic: {snapshot.target_source.chat_topic}")
+    if snapshot.source.session_namespace:
+        lines.append(f"• Session Namespace: `{snapshot.source.session_namespace}`")
+
+    lines.extend(
+        [
+            "",
+            "**Model**",
+            f"• Configured Model: `{snapshot.configured_model}`",
+            f"• Configured Provider: {provider_label(snapshot.configured_provider)} (`{snapshot.configured_provider}`)",
+            f"• Active Model: `{snapshot.active_model}`{' (fallback)' if snapshot.is_fallback else ''}",
+            f"• Active Provider: {provider_label(snapshot.active_provider)} (`{snapshot.active_provider}`)",
+        ]
+    )
+    if snapshot.runtime_error:
+        lines.append(f"• Runtime Resolution: failed ({snapshot.runtime_error})")
+    else:
+        lines.extend(
+            [
+                f"• Runtime Provider: {provider_label(snapshot.runtime_provider)} (`{snapshot.runtime_provider}`)",
+                f"• API Mode: `{snapshot.api_mode}`",
+                f"• Base URL: `{snapshot.base_url}`",
+                f"• Credentials: {'configured ✓' if snapshot.credentials_configured else 'missing ⚠️'}",
+            ]
+        )
+        if snapshot.credential_source:
+            lines.append(f"• Credential Source: `{snapshot.credential_source}`")
+        if snapshot.transport_command:
+            lines.append(f"• Transport Command: `{snapshot.transport_command}`")
+
+    lines.extend(
+        [
+            "",
+            "**Usage & Context**",
+            f"• Total Tokens: {snapshot.total_tokens:,}",
+            f"• Last Prompt Tokens: {snapshot.last_prompt_tokens:,}",
+            f"• Input / Output: {snapshot.input_tokens:,} / {snapshot.output_tokens:,}",
+            f"• Cache Read / Write: {snapshot.cache_read_tokens:,} / {snapshot.cache_write_tokens:,}",
+        ]
+    )
+    if snapshot.context_length is not None:
+        lines.append(f"• Context Window: {snapshot.context_length:,} tokens")
+    if snapshot.estimated_cost_usd:
+        lines.append(
+            f"• Estimated Cost: ${snapshot.estimated_cost_usd:.4f} ({snapshot.cost_status or 'unknown'})"
+        )
+    elif snapshot.cost_status and snapshot.cost_status != "unknown":
+        lines.append(f"• Cost Status: `{snapshot.cost_status}`")
+
+    lines.extend(
+        [
+            "",
+            "**Runtime**",
+            f"• Agent Running: {_yes_no(snapshot.is_running, 'Yes ⚡', 'No')}",
+            f"• Pending Interrupt: {_yes_no(snapshot.has_pending_message)}",
+            f"• Pending Approval: {_yes_no(snapshot.has_pending_approval)}",
+            f"• Background Processes: {_yes_no(snapshot.has_background_process)}",
+            f"• Voice Mode: `{snapshot.voice_mode}`",
+        ]
+    )
+    if snapshot.approval_command_preview:
+        lines.append(f"• Approval Command: `{snapshot.approval_command_preview}`")
+
+    lines.extend(
+        [
+            "",
+            "**Platforms**",
+            f"• Connected: {', '.join(snapshot.connected_platforms) if snapshot.connected_platforms else 'none'}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _render_command_lines(command_names: tuple[str, ...]) -> list[str]:
+    lookup = _command_lookup()
+    lines: list[str] = []
+    for name in command_names:
+        cmd = lookup.get(name)
+        if cmd is None:
+            continue
+        lines.append(
+            f"`{format_gateway_command_signature(cmd)}` — {cmd.description}{_alias_note(cmd)}"
+        )
+    return lines
+
+
+def render_discord_help() -> str:
+    """Render concise Discord help with clear separation from /commands."""
+    skill_cmds = _load_skill_commands()
+    lines = [
+        "📖 **Hermes Help**",
+        "",
+        "Use `/commands` for the full command catalog.",
+        "",
+        "**Quick Start**",
+        *(
+            _render_command_lines(
+                ("help", "commands", "status", "whoami", "model", "models")
+            )
+        ),
+        "",
+        "**Session**",
+        *(_render_command_lines(("new", "retry", "undo", "thread", "resume", "title", "compress", "stop"))),
+        "",
+        "**Configuration**",
+        *(_render_command_lines(("model", "models", "provider", "reasoning", "personality", "voice"))),
+        "",
+        "**Info & Maintenance**",
+        *(_render_command_lines(("usage", "insights", "reload-mcp", "update"))),
+    ]
+    if skill_cmds:
+        lines.extend(
+            [
+                "",
+                f"**Skill Commands** ({len(skill_cmds)} installed)",
+            ]
+        )
+        for name, description in skill_cmds.items():
+            lines.append(f"`{name}` — {description}")
+    return "\n".join(lines)
+
+
+def render_discord_commands() -> str:
+    """Render the full grouped Discord command catalog."""
+    skill_cmds = _load_skill_commands()
+    lines = [
+        "🧭 **Hermes Command Catalog**",
+        "",
+        "Use `/help` for the guided overview.",
+    ]
+    for category, commands in gateway_commands_by_category():
+        lines.extend(["", f"**{category}**"])
+        for cmd in commands:
+            lines.append(
+                f"`{format_gateway_command_signature(cmd)}` — {cmd.description}{_alias_note(cmd)}"
+            )
+    if skill_cmds:
+        lines.extend(["", "**Skill Commands**"])
+        for name, description in skill_cmds.items():
+            lines.append(f"`{name}` — {description}")
+    return "\n".join(lines)
+
+
+def collect_discord_whoami_snapshot(runner: Any, event: MessageEvent) -> DiscordWhoamiSnapshot:
+    """Collect Discord identity and routing details."""
+    session_source = runner._session_source_for_event(event)
+    target_source = _resolve_target_source(event, session_source)
+    session_key = runner._session_key_for_source(session_source)
+    return DiscordWhoamiSnapshot(
+        source=session_source,
+        target_source=target_source,
+        session_key=session_key,
+    )
+
+
+def render_discord_whoami(snapshot: DiscordWhoamiSnapshot) -> str:
+    """Render Discord sender and routing identity."""
+    source = snapshot.source
+    target = snapshot.target_source
+    lines = [
+        "👤 **Hermes Sees You As**",
+        "",
+        "**Identity**",
+        f"• Platform: {source.platform.value if source.platform else 'unknown'}",
+        f"• User ID: `{source.user_id or 'unknown'}`",
+        f"• User Name: {source.user_name or 'unknown'}",
+        "",
+        "**Routing**",
+        f"• Chat ID: `{target.chat_id}`",
+        f"• Chat Type: `{target.chat_type}`",
+        f"• Chat Name: {target.chat_name or 'unknown'}",
+    ]
+    if target.thread_id:
+        lines.append(f"• Thread ID: `{target.thread_id}`")
+    if target.chat_topic:
+        lines.append(f"• Chat Topic: {target.chat_topic}")
+    if source.session_namespace:
+        lines.append(f"• Session Namespace: `{source.session_namespace}`")
+    lines.append(f"• Session Key: `{_short_id(snapshot.session_key, limit=18)}`")
+    return "\n".join(lines)
