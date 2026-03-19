@@ -87,6 +87,12 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
             lambda: "/whoami",
         ),
         DiscordNativeCommandSpec(
+            "id",
+            "Alias for /whoami",
+            "simple",
+            lambda: "/id",
+        ),
+        DiscordNativeCommandSpec(
             "status",
             "Show Hermes session status",
             "simple",
