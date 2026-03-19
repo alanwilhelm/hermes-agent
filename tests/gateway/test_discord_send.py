@@ -81,6 +81,49 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert send_calls[1]["reference"] is None
 
 
+@pytest.mark.asyncio
+async def test_edit_message_updates_existing_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=channel),
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message("555", "99", "updated")
+
+    assert result.success is True
+    assert result.message_id == "99"
+    channel.fetch_message.assert_awaited_once_with(99)
+    message.edit.assert_awaited_once_with(content="updated")
+
+
+@pytest.mark.asyncio
+async def test_edit_message_returns_not_connected_when_client_missing():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = None
+
+    result = await adapter.edit_message("555", "99", "updated")
+
+    assert result.success is False
+    assert result.error == "Not connected"
+
+
+@pytest.mark.asyncio
+async def test_edit_message_returns_channel_error_for_missing_channel():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=None),
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    result = await adapter.edit_message("555", "99", "updated")
+
+    assert result.success is False
+    assert result.error == "Channel 555 not found"
+
+
 class _FakeHistoryIterator:
     def __init__(self, messages):
         self._messages = list(messages)
