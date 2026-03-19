@@ -305,6 +305,55 @@ async def test_get_channel_permissions_serializes_dm_thread_flags_as_false():
 
 
 @pytest.mark.asyncio
+async def test_get_accessible_channels_includes_normalized_target_metadata():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    perms = SimpleNamespace(
+        view_channel=True,
+        read_messages=True,
+        send_messages=True,
+        read_message_history=True,
+        attach_files=True,
+        embed_links=True,
+        add_reactions=True,
+        manage_threads=False,
+        create_public_threads=True,
+        create_private_threads=False,
+    )
+    guild = SimpleNamespace(id=777, name="Hermes")
+    channel = SimpleNamespace(
+        id=123,
+        name="general",
+        guild=guild,
+        permissions_for=MagicMock(return_value=perms),
+    )
+    guild.me = SimpleNamespace(id=999)
+    guild.text_channels = [channel]
+    adapter._client = SimpleNamespace(guilds=[guild], user=SimpleNamespace(id=999))
+
+    result = await adapter.get_accessible_channels()
+
+    assert result == [
+        {
+            "channel_id": "123",
+            "channel_name": "general",
+            "guild_id": "777",
+            "guild_name": "Hermes",
+            "channel_kind": "channel",
+            "qualified_name": "Hermes/general",
+            "mention": "<#123>",
+            "can_read": True,
+            "can_send": True,
+            "can_read_history": True,
+            "can_attach_files": True,
+            "can_embed_links": True,
+            "can_add_reactions": True,
+            "can_manage_threads": False,
+            "can_create_threads": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_threads_returns_serialized_threads():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     thread = sys.modules["discord"].Thread()
