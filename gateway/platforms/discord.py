@@ -56,6 +56,7 @@ from gateway.platforms.discord_impl import delivery as discord_delivery
 from gateway.platforms.discord_impl import history as discord_history
 from gateway.platforms.discord_impl import intake as discord_intake
 from gateway.platforms.discord_impl import interactions as discord_interactions
+from gateway.platforms.discord_impl import messaging as discord_messaging
 from gateway.platforms.discord_impl import permissions as discord_permissions
 from gateway.platforms.discord_impl import state as discord_state
 from gateway.platforms.discord_impl import threads as discord_threads
@@ -652,21 +653,22 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
     ) -> SendResult:
         """Edit a previously sent Discord message."""
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        try:
-            channel = await discord_delivery.resolve_channel(self._client, chat_id)
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
-            msg = await channel.fetch_message(int(message_id))
-            formatted = self.format_message(content)
-            if len(formatted) > self.MAX_MESSAGE_LENGTH:
-                formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
-            return SendResult(success=True, message_id=message_id)
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+        result = await discord_messaging.edit_message(
+            self._client,
+            chat_id,
+            message_id,
+            content,
+            format_message=self.format_message,
+            max_message_length=self.MAX_MESSAGE_LENGTH,
+        )
+        if not result.success and result.error:
+            logger.error(
+                "[%s] Failed to edit Discord message %s: %s",
+                self.name,
+                message_id,
+                result.error,
+            )
+        return result
 
     async def _send_file_attachment(
         self,
