@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from dataclasses import asdict
 from typing import Callable, Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,10 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.discord_impl import config as discord_config
 from gateway.platforms.discord_impl import delivery as discord_delivery
+from gateway.platforms.discord_impl import history as discord_history
 from gateway.platforms.discord_impl import intake as discord_intake
 from gateway.platforms.discord_impl import interactions as discord_interactions
+from gateway.platforms.discord_impl import permissions as discord_permissions
 from gateway.platforms.discord_impl import state as discord_state
 from gateway.platforms.discord_impl import threads as discord_threads
 
@@ -680,13 +683,21 @@ class DiscordAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send a local file as a Discord attachment."""
-        return await discord_delivery.send_file_attachment(
-            self._client,
-            chat_id,
-            file_path,
-            caption=caption,
-            file_name=file_name,
-        )
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        channel = await discord_delivery.resolve_channel(self._client, chat_id)
+        if not channel:
+            return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+        if discord is None:  # pragma: no cover - import guard
+            return SendResult(success=False, error="discord.py not installed")
+
+        filename = file_name or os.path.basename(file_path)
+        with open(file_path, "rb") as fh:
+            file = discord.File(fh, filename=filename)
+            msg = await channel.send(content=caption if caption else None, file=file)
+        return SendResult(success=True, message_id=str(msg.id))
 
     async def play_tts(
         self,
@@ -1256,6 +1267,58 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
+
+    async def fetch_channel_history(
+        self,
+        channel_id: str,
+        limit: int = 100,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+    ) -> list:
+        """Fetch bounded message history."""
+        if not self._client:
+            return []
+        messages = await discord_history.fetch_history(
+            self._client,
+            channel_id,
+            limit=limit,
+            before=before,
+            after=after,
+        )
+        return [asdict(message) for message in messages]
+
+    async def search_channel_history(
+        self,
+        channel_id: str,
+        query: str,
+        limit: int = 50,
+        author_id: Optional[str] = None,
+    ) -> list:
+        """Search channel history."""
+        if not self._client:
+            return []
+        messages = await discord_history.search_history(
+            self._client,
+            channel_id,
+            query,
+            limit=limit,
+            author_id=author_id,
+        )
+        return [asdict(message) for message in messages]
+
+    async def get_channel_permissions(self, channel_id: str) -> Optional[dict]:
+        """Get bot permissions for a channel."""
+        if not self._client:
+            return None
+        permissions = await discord_permissions.check_channel_permissions(self._client, channel_id)
+        return asdict(permissions) if permissions else None
+
+    async def get_accessible_channels(self, guild_id: Optional[str] = None) -> list:
+        """List accessible channels."""
+        if not self._client:
+            return []
+        channels = await discord_permissions.list_accessible_channels(self._client, guild_id=guild_id)
+        return [asdict(channel) for channel in channels]
     
     async def _resolve_allowed_usernames(self) -> None:
         """
