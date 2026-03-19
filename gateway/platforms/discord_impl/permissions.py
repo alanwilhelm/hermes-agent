@@ -74,8 +74,8 @@ def _build_channel_permissions(client: Any, channel: Any) -> ChannelPermissions:
             can_attach_files=True,
             can_embed_links=True,
             can_add_reactions=True,
-            can_manage_threads=True,
-            can_create_threads=True,
+            can_manage_threads=False,
+            can_create_threads=False,
         )
 
     guild = getattr(channel, "guild", None)

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -78,3 +79,146 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert channel.send.await_count == 2
     assert send_calls[0]["reference"] is ref_msg
     assert send_calls[1]["reference"] is None
+
+
+class _FakeHistoryIterator:
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self._index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._messages):
+            raise StopAsyncIteration
+        message = self._messages[self._index]
+        self._index += 1
+        return message
+
+
+class _FakeHistoryChannel:
+    def __init__(self, messages, readable=True):
+        self.id = 123
+        self.name = "general"
+        self.guild = SimpleNamespace(me=SimpleNamespace(id=999), name="Hermes")
+        self._messages = list(messages)
+        self.permissions_for = MagicMock(
+            return_value=SimpleNamespace(
+                view_channel=readable,
+                read_message_history=readable,
+                send_messages=True,
+                attach_files=True,
+                embed_links=True,
+                add_reactions=True,
+                manage_threads=False,
+                create_public_threads=False,
+                create_private_threads=False,
+            )
+        )
+
+    def history(self, *, limit, before=None, after=None):
+        filtered = list(self._messages)
+        if before is not None:
+            filtered = [message for message in filtered if int(message.id) < int(before.id)]
+        if after is not None:
+            filtered = [message for message in filtered if int(message.id) > int(after.id)]
+        return _FakeHistoryIterator(filtered[:limit])
+
+
+def _history_message(
+    message_id,
+    *,
+    content,
+    author_id="42",
+    author_name="Jezza",
+    is_bot=False,
+    timestamp=None,
+):
+    if timestamp is None:
+        timestamp = datetime(2026, 3, 18, 12, 0, 0, tzinfo=timezone.utc)
+    return SimpleNamespace(
+        id=message_id,
+        author=SimpleNamespace(id=author_id, name=author_name, display_name=author_name, bot=is_bot),
+        content=content,
+        created_at=timestamp,
+        attachments=[],
+        reference=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_history_returns_empty_for_missing_channel():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=None),
+        fetch_channel=AsyncMock(return_value=None),
+        user=SimpleNamespace(id=999),
+    )
+
+    result = await adapter.fetch_channel_history("123")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_search_channel_history_serializes_messages():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(
+            return_value=_FakeHistoryChannel(
+                [
+                    _history_message(10, content="Hermes status update"),
+                    _history_message(9, content="unrelated"),
+                ]
+            )
+        ),
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=999),
+    )
+
+    result = await adapter.search_channel_history("123", "hermes", limit=1)
+
+    assert result == [
+        {
+            "id": "10",
+            "author_id": "42",
+            "author_name": "Jezza",
+            "content": "Hermes status update",
+            "timestamp": "2026-03-18T12:00:00+00:00",
+            "is_bot": False,
+            "attachments": [],
+            "reply_to": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_channel_permissions_serializes_dm_thread_flags_as_false():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    dm_channel = sys.modules["discord"].DMChannel()
+    dm_channel.id = 321
+    dm_channel.name = None
+    dm_channel.guild = None
+    dm_channel.recipient = SimpleNamespace(name="Alan")
+
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=dm_channel),
+        fetch_channel=AsyncMock(return_value=None),
+        user=SimpleNamespace(id=999),
+    )
+
+    result = await adapter.get_channel_permissions("321")
+
+    assert result == {
+        "channel_id": "321",
+        "channel_name": "Alan",
+        "can_read": True,
+        "can_send": True,
+        "can_read_history": True,
+        "can_attach_files": True,
+        "can_embed_links": True,
+        "can_add_reactions": True,
+        "can_manage_threads": False,
+        "can_create_threads": False,
+    }
