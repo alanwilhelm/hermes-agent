@@ -428,6 +428,7 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._runtime_debug_overrides: Dict[str, Any] = {}
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
@@ -456,6 +457,7 @@ class GatewayRunner:
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._bash_jobs: Dict[str, str] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -516,9 +518,321 @@ class GatewayRunner:
         runtime_controls = self._load_runtime_controls()
         self._session_send_policies: Dict[str, str] = runtime_controls["send_policies"]
         self._session_docks: Dict[str, Dict[str, Any]] = runtime_controls["dock_targets"]
-
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+    _DEBUG_REASONING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    _DEBUG_BACKGROUND_NOTIFICATION_MODES = {"all", "result", "error", "off"}
+    _DEBUG_PROVIDER_DATA_COLLECTION_MODES = {"allow", "deny"}
+    _DEBUG_DISCORD_BOT_FILTER_POLICIES = {"none", "mentions", "all"}
+    _DEBUG_SUPPORTED_KEYS: Dict[str, str] = {
+        "agent.system_prompt": "Ephemeral system prompt for new turns in the running gateway process.",
+        "agent.reasoning_effort": "Runtime reasoning effort (none|minimal|low|medium|high|xhigh).",
+        "display.show_reasoning": "Show or hide model reasoning in responses.",
+        "display.background_process_notifications": "Background process watcher notifications (all|result|error|off).",
+        "provider_routing.only": "Preferred provider allowlist for OpenRouter routing.",
+        "provider_routing.ignore": "Providers to skip for OpenRouter routing.",
+        "provider_routing.order": "Explicit provider preference order for OpenRouter routing.",
+        "provider_routing.sort": "Provider routing sort strategy.",
+        "provider_routing.require_parameters": "Require providers that support all request parameters.",
+        "provider_routing.data_collection": "Provider data collection policy (allow|deny).",
+        "fallback_model.provider": "Fallback provider used when the primary route fails.",
+        "fallback_model.model": "Fallback model used when the primary route fails.",
+        "smart_model_routing.enabled": "Enable or disable cheap-vs-strong smart routing.",
+        "smart_model_routing.max_simple_chars": "Maximum message characters for cheap-route eligibility.",
+        "smart_model_routing.max_simple_words": "Maximum word count for cheap-route eligibility.",
+        "smart_model_routing.cheap_model.provider": "Cheap-route provider.",
+        "smart_model_routing.cheap_model.model": "Cheap-route model.",
+        "discord.allow_bots": "Discord bot-message policy (none|mentions|all).",
+        "discord.free_response_channels": "Discord channel IDs that bypass mention gating.",
+        "discord.require_mention": "Require @mention in Discord server channels.",
+        "discord.auto_thread": "Auto-create Discord threads on @mention.",
+    }
+
+    def _get_runtime_debug_overrides(self) -> Dict[str, Any]:
+        overrides = getattr(self, "_runtime_debug_overrides", None)
+        if overrides is None:
+            overrides = {}
+            self._runtime_debug_overrides = overrides
+        return overrides
+
+    @staticmethod
+    def _parse_debug_scalar(raw_value: str) -> Any:
+        import yaml
+
+        text = (raw_value or "").strip()
+        if not text:
+            return ""
+        try:
+            return yaml.safe_load(text)
+        except Exception:
+            return text
+
+    @classmethod
+    def _parse_debug_bool(cls, raw_value: str) -> bool:
+        parsed = cls._parse_debug_scalar(raw_value)
+        if isinstance(parsed, bool):
+            return parsed
+        if isinstance(parsed, str):
+            normalized = parsed.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError("expected a boolean value")
+
+    @classmethod
+    def _parse_debug_string_list(cls, raw_value: str) -> List[str]:
+        parsed = cls._parse_debug_scalar(raw_value)
+        if parsed is None:
+            return []
+        if isinstance(parsed, (list, tuple, set)):
+            items = list(parsed)
+        elif isinstance(parsed, str):
+            if "," in parsed:
+                items = [item.strip() for item in parsed.split(",")]
+            else:
+                items = [parsed.strip()]
+        else:
+            items = [str(parsed).strip()]
+        return [str(item).strip() for item in items if str(item).strip()]
+
+    @classmethod
+    def _parse_debug_optional_string(cls, raw_value: str) -> Optional[str]:
+        parsed = cls._parse_debug_scalar(raw_value)
+        if parsed is None:
+            return None
+        text = str(parsed).strip()
+        if not text:
+            return None
+        return text
+
+    @classmethod
+    def _parse_debug_int(cls, raw_value: str) -> int:
+        parsed = cls._parse_debug_scalar(raw_value)
+        try:
+            return int(parsed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected an integer value") from exc
+
+    @classmethod
+    def _parse_debug_value(cls, key: str, raw_value: str) -> Any:
+        if key == "agent.system_prompt":
+            return str(raw_value)
+
+        if key == "agent.reasoning_effort":
+            normalized = str(raw_value).strip().lower()
+            if normalized == "off":
+                normalized = "none"
+            if normalized not in cls._DEBUG_REASONING_LEVELS:
+                raise ValueError(
+                    "expected one of: none, minimal, low, medium, high, xhigh"
+                )
+            return normalized
+
+        if key == "display.show_reasoning":
+            return cls._parse_debug_bool(raw_value)
+
+        if key == "display.background_process_notifications":
+            normalized = str(raw_value).strip().lower()
+            if normalized not in cls._DEBUG_BACKGROUND_NOTIFICATION_MODES:
+                raise ValueError("expected one of: all, result, error, off")
+            return normalized
+
+        if key in {
+            "provider_routing.only",
+            "provider_routing.ignore",
+            "provider_routing.order",
+            "discord.free_response_channels",
+        }:
+            return cls._parse_debug_string_list(raw_value)
+
+        if key == "provider_routing.sort":
+            return cls._parse_debug_optional_string(raw_value)
+
+        if key == "provider_routing.require_parameters":
+            return cls._parse_debug_bool(raw_value)
+
+        if key == "provider_routing.data_collection":
+            value = cls._parse_debug_optional_string(raw_value)
+            if value is None:
+                return None
+            normalized = value.lower()
+            if normalized not in cls._DEBUG_PROVIDER_DATA_COLLECTION_MODES:
+                raise ValueError("expected one of: allow, deny")
+            return normalized
+
+        if key in {"fallback_model.provider", "fallback_model.model"}:
+            return cls._parse_debug_optional_string(raw_value)
+
+        if key == "smart_model_routing.enabled":
+            return cls._parse_debug_bool(raw_value)
+
+        if key in {"smart_model_routing.max_simple_chars", "smart_model_routing.max_simple_words"}:
+            return cls._parse_debug_int(raw_value)
+
+        if key in {"smart_model_routing.cheap_model.provider", "smart_model_routing.cheap_model.model"}:
+            return cls._parse_debug_optional_string(raw_value)
+
+        if key == "discord.allow_bots":
+            normalized = str(raw_value).strip().lower()
+            if normalized not in cls._DEBUG_DISCORD_BOT_FILTER_POLICIES:
+                raise ValueError("expected one of: none, mentions, all")
+            return normalized
+
+        if key in {"discord.require_mention", "discord.auto_thread"}:
+            return cls._parse_debug_bool(raw_value)
+
+        raise KeyError(key)
+
+    @staticmethod
+    def _format_runtime_debug_value(value: Any) -> str:
+        return format_yaml_block(value)
+
+    @staticmethod
+    def _reasoning_config_to_level(reasoning_config: dict | None) -> str:
+        if reasoning_config is None:
+            return "medium"
+        if reasoning_config.get("enabled") is False:
+            return "none"
+        return str(reasoning_config.get("effort") or "medium").strip().lower()
+
+    @classmethod
+    def _reasoning_level_to_config(cls, level: str) -> dict | None:
+        normalized = (level or "").strip().lower()
+        if not normalized or normalized == "medium":
+            return {"enabled": True, "effort": "medium"}
+        if normalized == "none":
+            return {"enabled": False}
+        if normalized in {"minimal", "low", "high", "xhigh"}:
+            return {"enabled": True, "effort": normalized}
+        return None
+
+    def _get_effective_reasoning_config(self) -> dict | None:
+        overrides = self._get_runtime_debug_overrides()
+        if "agent.reasoning_effort" not in overrides:
+            return self._load_reasoning_config()
+        return self._reasoning_level_to_config(str(overrides["agent.reasoning_effort"]))
+
+    def _get_effective_show_reasoning(self) -> bool:
+        overrides = self._get_runtime_debug_overrides()
+        if "display.show_reasoning" in overrides:
+            return bool(overrides["display.show_reasoning"])
+        return self._load_show_reasoning()
+
+    def _get_effective_background_notifications_mode(self) -> str:
+        overrides = self._get_runtime_debug_overrides()
+        if "display.background_process_notifications" in overrides:
+            return str(overrides["display.background_process_notifications"])
+        return self._load_background_notifications_mode()
+
+    def _build_effective_provider_routing(self) -> dict:
+        merged = dict(self._load_provider_routing() or {})
+        overrides = self._get_runtime_debug_overrides()
+        for suffix in ("only", "ignore", "order", "sort", "require_parameters", "data_collection"):
+            key = f"provider_routing.{suffix}"
+            if key in overrides:
+                merged[suffix] = overrides[key]
+        return merged
+
+    def _build_effective_fallback_model(self) -> dict | None:
+        merged = dict(self._load_fallback_model() or {})
+        overrides = self._get_runtime_debug_overrides()
+        for suffix in ("provider", "model"):
+            key = f"fallback_model.{suffix}"
+            if key in overrides:
+                merged[suffix] = overrides[key]
+        provider = str(merged.get("provider") or "").strip()
+        model = str(merged.get("model") or "").strip()
+        if not provider or not model:
+            return None
+        return {"provider": provider, "model": model}
+
+    def _build_effective_smart_model_routing(self) -> dict:
+        merged = dict(self._load_smart_model_routing() or {})
+        cheap_model = dict(merged.get("cheap_model") or {})
+        merged["cheap_model"] = cheap_model
+        overrides = self._get_runtime_debug_overrides()
+
+        for suffix in ("enabled", "max_simple_chars", "max_simple_words"):
+            key = f"smart_model_routing.{suffix}"
+            if key in overrides:
+                merged[suffix] = overrides[key]
+
+        for suffix in ("provider", "model"):
+            key = f"smart_model_routing.cheap_model.{suffix}"
+            if key in overrides:
+                cheap_model[suffix] = overrides[key]
+
+        return merged
+
+    def _build_effective_discord_policy_overrides(self) -> dict:
+        overrides = self._get_runtime_debug_overrides()
+        policy_overrides: Dict[str, Any] = {}
+        for source_key, target_key in (
+            ("discord.allow_bots", "allow_bots"),
+            ("discord.free_response_channels", "free_response_channels"),
+            ("discord.require_mention", "require_mention"),
+            ("discord.auto_thread", "auto_thread"),
+        ):
+            if source_key in overrides:
+                policy_overrides[target_key] = overrides[source_key]
+        return policy_overrides
+
+    def _get_effective_runtime_debug_value(self, key: str) -> Any:
+        overrides = self._get_runtime_debug_overrides()
+        if key == "agent.system_prompt":
+            return overrides[key] if key in overrides else self._load_ephemeral_system_prompt()
+        if key == "agent.reasoning_effort":
+            if key in overrides:
+                return overrides[key]
+            return self._reasoning_config_to_level(self._load_reasoning_config())
+        if key == "display.show_reasoning":
+            return self._get_effective_show_reasoning()
+        if key == "display.background_process_notifications":
+            return self._get_effective_background_notifications_mode()
+        if key.startswith("provider_routing."):
+            return self._build_effective_provider_routing().get(key.split(".", 1)[1])
+        if key.startswith("fallback_model."):
+            current = self._build_effective_fallback_model() or {}
+            return current.get(key.split(".", 1)[1])
+        if key.startswith("smart_model_routing.cheap_model."):
+            current = self._build_effective_smart_model_routing().get("cheap_model") or {}
+            return current.get(key.rsplit(".", 1)[1])
+        if key.startswith("smart_model_routing."):
+            current = self._build_effective_smart_model_routing()
+            return current.get(key.split(".", 1)[1])
+        if key.startswith("discord."):
+            from gateway.platforms.discord_impl import config as discord_config
+
+            policy = discord_config.load_policy_config(
+                getattr(self, "config", None).platforms.get(Platform.DISCORD)
+                if getattr(self, "config", None) and getattr(self.config, "platforms", None)
+                else None,
+                overrides=self._build_effective_discord_policy_overrides(),
+            )
+            mapping = {
+                "discord.allow_bots": policy.bot_filter_policy,
+                "discord.free_response_channels": sorted(policy.free_response_channels),
+                "discord.require_mention": policy.require_mention,
+                "discord.auto_thread": policy.auto_thread,
+            }
+            return mapping[key]
+        raise KeyError(key)
+
+    def _apply_runtime_debug_overrides(self) -> None:
+        self._ephemeral_system_prompt = str(self._get_effective_runtime_debug_value("agent.system_prompt") or "")
+        self._reasoning_config = self._get_effective_reasoning_config()
+        self._show_reasoning = self._get_effective_show_reasoning()
+        self._provider_routing = self._build_effective_provider_routing()
+        self._fallback_model = self._build_effective_fallback_model()
+        self._smart_model_routing = self._build_effective_smart_model_routing()
+
+        discord_adapter = getattr(self, "adapters", {}).get(Platform.DISCORD)
+        if discord_adapter and hasattr(discord_adapter, "apply_runtime_policy_overrides"):
+            discord_adapter.apply_runtime_policy_overrides(
+                self._build_effective_discord_policy_overrides()
+            )
 
     def _get_or_create_gateway_honcho(self, session_key: str):
         """Return a persistent Honcho manager/config pair for this gateway session."""
@@ -959,6 +1273,14 @@ class GatewayRunner:
             approval_mod.save_permanent_allowlist(approval_mod._permanent_approved)
 
         self._pending_approvals.pop(session_key, None)
+        on_approve = pending.get("on_approve")
+        if callable(on_approve):
+            try:
+                return on_approve(normalized)
+            except Exception as e:
+                logger.exception("Pending approval callback failed")
+                return f"❌ Approved command failed: {e}"
+
         result = terminal_tool(command=command, force=True)
         decision_label = "allow-always" if normalized == "allow-always" else "allow-once"
         return (
@@ -1019,6 +1341,30 @@ class GatewayRunner:
             return f"{platform}:{name} (`{chat_id}`)"
         return f"{platform} home channel (`{chat_id}`)"
 
+    def _get_bash_jobs(self) -> Dict[str, str]:
+        jobs = getattr(self, "_bash_jobs", None)
+        if jobs is None:
+            jobs = {}
+            self._bash_jobs = jobs
+        return jobs
+
+    @staticmethod
+    def _rewrite_bash_shortcut(raw_text: str) -> Optional[str]:
+        text = str(raw_text or "")
+        stripped = text.lstrip()
+        if not stripped.startswith("!"):
+            return None
+        payload = stripped[1:].strip()
+        if not payload:
+            return None
+        if payload.startswith("poll"):
+            args = payload[4:].strip()
+            return f"/bash poll {args}".strip()
+        if payload.startswith("stop"):
+            args = payload[4:].strip()
+            return f"/bash stop {args}".strip()
+        return f"/bash {payload}"
+
     @staticmethod
     def _split_command_args(raw: str, *, max_parts: int | None = None) -> list[str]:
         text = str(raw or "").strip()
@@ -1044,6 +1390,208 @@ class GatewayRunner:
             f"⚠️ `/{command}` is still blocked in Hermes parity work.\n\n"
             f"**Blocked by:** `{plan_id}`\n"
             f"**Reason:** {detail}"
+        )
+
+    def _get_bash_foreground_seconds(self) -> int:
+        raw_ms = os.getenv("HERMES_BASH_FOREGROUND_MS", "").strip()
+        if not raw_ms:
+            try:
+                cfg = load_raw_user_config() or {}
+                commands_cfg = cfg.get("commands", {}) if isinstance(cfg, dict) else {}
+                raw_ms = str(commands_cfg.get("bashForegroundMs", "") or "").strip()
+            except Exception:
+                raw_ms = ""
+        try:
+            ms = int(raw_ms or "2000")
+        except ValueError:
+            ms = 2000
+        if ms <= 0:
+            return 0
+        return max(1, (ms + 999) // 1000)
+
+    @staticmethod
+    def _format_bash_output(output: str, *, limit: int = 3500) -> str:
+        text = str(output or "").rstrip()
+        if not text:
+            return "_(no output)_"
+        if len(text) > limit:
+            text = text[-limit:]
+            text = f"...\n{text}"
+        return f"```\n{text}\n```"
+
+    def _resolve_bash_target_session_id(self, session_key: str, raw_target: str) -> Optional[str]:
+        from tools.process_registry import process_registry
+
+        target = str(raw_target or "").strip()
+        jobs = self._get_bash_jobs()
+        if target:
+            return target
+        session_id = jobs.get(session_key)
+        if not session_id:
+            return None
+        current = process_registry.get(session_id)
+        if current is None or current.exited:
+            jobs.pop(session_key, None)
+            return None
+        return session_id
+
+    def _store_pending_bash_approval(
+        self,
+        *,
+        session_key: str,
+        command: str,
+        approval_payload: dict[str, Any],
+        on_approve,
+    ) -> str:
+        approval_id = self._new_approval_id()
+        pending = {
+            "approval_id": approval_id,
+            "session_key": session_key,
+            "created_at": datetime.now().isoformat(),
+            "command": command,
+            "description": approval_payload.get("description", "command flagged"),
+            "pattern_key": approval_payload.get("pattern_key", ""),
+            "on_approve": on_approve,
+        }
+        self._pending_approvals[session_key] = pending
+        return approval_id
+
+    def _run_bash_process(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        command: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        from tools.terminal_tool import terminal_tool
+
+        context = build_session_context(source, self.config)
+        tracked_vars = [
+            "HERMES_SESSION_PLATFORM",
+            "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_THREAD_ID",
+            "HERMES_SESSION_KEY",
+            "HERMES_SESSION_SEND_POLICY",
+        ]
+        previous_env = {name: os.environ.get(name) for name in tracked_vars}
+        try:
+            self._set_session_env(context)
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            os.environ["HERMES_SESSION_SEND_POLICY"] = self._session_send_policy(session_key)
+            raw = terminal_tool(command=command, background=True, force=force)
+        finally:
+            self._clear_session_env()
+            for name in ("HERMES_SESSION_KEY", "HERMES_SESSION_SEND_POLICY"):
+                previous = previous_env.get(name)
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+            for name in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID"):
+                previous = previous_env.get(name)
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return {"status": "error", "error": raw}
+            if isinstance(parsed, dict):
+                return parsed
+        return {"status": "error", "error": "Unexpected terminal result"}
+
+    def _resume_bash_after_approval(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        command: str,
+    ) -> str:
+        result = self._run_bash_process(
+            source=source,
+            session_key=session_key,
+            command=command,
+            force=True,
+        )
+        return self._format_bash_result(
+            session_key=session_key,
+            command=command,
+            result=result,
+        )
+
+    def _format_bash_result(
+        self,
+        *,
+        session_key: str,
+        command: str,
+        result: dict[str, Any],
+    ) -> str:
+        from tools.process_registry import process_registry
+
+        status = str(result.get("status") or "").strip()
+        if status == "approval_required":
+            return str(result.get("error") or "Approval required.")
+        if status == "blocked":
+            return f"❌ {result.get('error') or 'Command blocked.'}"
+        if result.get("error") and not result.get("session_id"):
+            return f"❌ Bash command failed: {result.get('error')}"
+
+        proc_id = str(result.get("session_id") or "").strip()
+        if not proc_id:
+            return f"❌ Bash command failed: {result.get('error') or 'No process session ID returned.'}"
+
+        self._get_bash_jobs()[session_key] = proc_id
+        wait_seconds = self._get_bash_foreground_seconds()
+        wait_result = process_registry.wait(proc_id, timeout=wait_seconds) if wait_seconds > 0 else {"status": "timeout"}
+
+        if wait_result.get("status") == "exited":
+            self._get_bash_jobs().pop(session_key, None)
+            exit_code = wait_result.get("exit_code")
+            output = wait_result.get("output", "")
+            return "\n".join(
+                [
+                    "💻 **Bash Complete**",
+                    "",
+                    f"**Command:** `{command}`",
+                    f"**Exit Code:** `{exit_code}`",
+                    "",
+                    self._format_bash_output(output),
+                ]
+            )
+
+        if wait_result.get("status") == "interrupted":
+            self._get_bash_jobs().pop(session_key, None)
+            return "\n".join(
+                [
+                    "⚡ **Bash Interrupted**",
+                    "",
+                    f"**Command:** `{command}`",
+                    "",
+                    self._format_bash_output(wait_result.get("output", "")),
+                ]
+            )
+
+        process_info = process_registry.poll(proc_id)
+        pid = process_info.get("pid")
+        preview = process_info.get("output_preview", "")
+        return "\n".join(
+            [
+                "💻 **Bash Running**",
+                "",
+                f"**Command:** `{command}`",
+                f"**Session ID:** `{proc_id}`",
+                f"**PID:** `{pid}`" if pid else "**PID:** `unknown`",
+                "",
+                "Use `/bash poll` or `!poll` to check progress.",
+                "Use `/bash stop` or `!stop` to terminate it.",
+                "",
+                self._format_bash_output(preview, limit=1200),
+            ]
         )
 
     def _prepare_skill_command(
@@ -2240,6 +2788,10 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        rewritten_bash = self._rewrite_bash_shortcut(event.text)
+        if rewritten_bash:
+            event.text = rewritten_bash
+
         # Check for commands
         command = event.get_command()
         
@@ -2458,11 +3010,7 @@ class GatewayRunner:
             )
 
         if canonical == "bash":
-            return self._parity_blocker_text(
-                "bash",
-                "0028",
-                "A dedicated gateway bash command surface and authorization model have not been implemented yet.",
-            )
+            return await self._handle_bash_command(event)
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -3753,11 +4301,220 @@ class GatewayRunner:
         )
 
     async def _handle_debug_command(self, event: MessageEvent) -> str:
-        """Handle /debug command - report the remaining parity blocker honestly."""
-        return self._parity_blocker_text(
-            "debug",
-            "0027",
-            "Hermes does not yet have a gateway-wide runtime override layer that can safely overlay live config reads.",
+        """Handle /debug command - live runtime overrides for the current gateway process."""
+        args = event.get_command_args().strip()
+        try:
+            parts = shlex.split(args) if args else []
+        except ValueError as exc:
+            return f"⚠️ Invalid debug arguments: {exc}"
+
+        if not parts or parts[0] == "show":
+            if len(parts) > 2:
+                return "Usage: `/debug show [key]`"
+            if len(parts) == 2:
+                key = parts[1].strip()
+                if key not in self._DEBUG_SUPPORTED_KEYS:
+                    supported = "\n".join(f"- `{name}`" for name in sorted(self._DEBUG_SUPPORTED_KEYS))
+                    return (
+                        f"⚠️ Unsupported debug key: `{key}`\n\n"
+                        f"**Supported keys**\n{supported}"
+                    )
+                overrides = self._get_runtime_debug_overrides()
+                value = self._get_effective_runtime_debug_value(key)
+                override_state = "yes" if key in overrides else "no"
+                return (
+                    "🛠️ **Runtime Debug Key**\n\n"
+                    f"**Key:** `{key}`\n"
+                    f"**Override active:** {override_state}\n\n"
+                    f"{self._format_runtime_debug_value(value)}"
+                )
+
+            overrides = self._get_runtime_debug_overrides()
+            active = {
+                key: self._get_effective_runtime_debug_value(key)
+                for key in sorted(overrides)
+            }
+            supported = "\n".join(
+                f"- `{name}` — {description}"
+                for name, description in self._DEBUG_SUPPORTED_KEYS.items()
+            )
+            active_block = "None" if not active else self._format_runtime_debug_value(active)
+            return (
+                "🛠️ **Runtime Debug Overrides**\n\n"
+                "Applies only to the running Hermes gateway process and the current Discord connection.\n"
+                "Config files are unchanged.\n\n"
+                "**Active overrides**\n"
+                f"{active_block}\n\n"
+                "**Usage**\n"
+                "`/debug show [key]`\n"
+                "`/debug set <key> <value>`\n"
+                "`/debug unset <key>`\n"
+                "`/debug reset`\n\n"
+                f"**Supported keys**\n{supported}"
+            )
+
+        action = parts[0].lower()
+        if action == "reset":
+            if len(parts) != 1:
+                return "Usage: `/debug reset`"
+            cleared = len(self._get_runtime_debug_overrides())
+            self._get_runtime_debug_overrides().clear()
+            self._apply_runtime_debug_overrides()
+            return (
+                "🛠️ ✓ Runtime debug overrides cleared.\n"
+                f"Removed `{cleared}` override(s) from the running gateway process."
+            )
+
+        if action == "unset":
+            if len(parts) != 2:
+                return "Usage: `/debug unset <key>`"
+            key = parts[1].strip()
+            if key not in self._DEBUG_SUPPORTED_KEYS:
+                return f"⚠️ Unsupported debug key: `{key}`"
+            removed = self._get_runtime_debug_overrides().pop(key, None)
+            self._apply_runtime_debug_overrides()
+            if removed is None:
+                return f"`{key}` did not have a runtime override."
+            return (
+                f"🛠️ ✓ Removed runtime override for `{key}`.\n\n"
+                f"{self._format_runtime_debug_value(self._get_effective_runtime_debug_value(key))}"
+            )
+
+        if action == "set":
+            if len(parts) < 3:
+                return "Usage: `/debug set <key> <value>`"
+            key = parts[1].strip()
+            if key not in self._DEBUG_SUPPORTED_KEYS:
+                return f"⚠️ Unsupported debug key: `{key}`"
+            value_text = args.split(None, 2)[2]
+            try:
+                parsed = self._parse_debug_value(key, value_text)
+            except ValueError as exc:
+                return f"⚠️ Invalid value for `{key}`: {exc}"
+            self._get_runtime_debug_overrides()[key] = parsed
+            self._apply_runtime_debug_overrides()
+            return (
+                f"🛠️ ✓ Runtime override set for `{key}`.\n"
+                "Applies immediately to the running gateway process only.\n\n"
+                f"{self._format_runtime_debug_value(self._get_effective_runtime_debug_value(key))}"
+            )
+
+        return (
+            f"⚠️ Unknown debug action: `{action}`\n\n"
+            "Use `/debug show [key]`, `/debug set <key> <value>`, `/debug unset <key>`, or `/debug reset`."
+        )
+
+    async def _handle_bash_command(self, event: MessageEvent) -> str:
+        """Handle /bash command and !-style shortcuts for host shell execution."""
+        from tools.process_registry import process_registry
+
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        session_key = session_entry.session_key
+
+        raw_args = event.get_command_args().strip()
+        parts = self._split_command_args(raw_args, max_parts=2)
+        if not parts:
+            return (
+                "Usage: `/bash <command>`\n"
+                "       `/bash poll [session_id]`\n"
+                "       `/bash stop [session_id]`\n\n"
+                "Shortcuts: `! <command>`, `!poll`, `!stop`"
+            )
+
+        action = parts[0].strip().lower()
+        if action == "poll":
+            target_id = self._resolve_bash_target_session_id(session_key, parts[1] if len(parts) > 1 else "")
+            if not target_id:
+                return "No active bash job found for this session."
+            poll = process_registry.poll(target_id)
+            if poll.get("status") == "not_found":
+                self._get_bash_jobs().pop(session_key, None)
+                return f"No bash job found for `{target_id}`."
+            log_payload = process_registry.read_log(target_id, limit=40)
+            if poll.get("status") == "exited":
+                self._get_bash_jobs().pop(session_key, None)
+                return "\n".join(
+                    [
+                        "💻 **Bash Complete**",
+                        "",
+                        f"**Session ID:** `{target_id}`",
+                        f"**Exit Code:** `{poll.get('exit_code')}`",
+                        "",
+                        self._format_bash_output(log_payload.get("output", "")),
+                    ]
+                )
+            return "\n".join(
+                [
+                    "💻 **Bash Status**",
+                    "",
+                    f"**Session ID:** `{target_id}`",
+                    f"**PID:** `{poll.get('pid')}`" if poll.get("pid") else "**PID:** `unknown`",
+                    f"**Uptime:** `{poll.get('uptime_seconds', 0)}s`",
+                    "",
+                    self._format_bash_output(log_payload.get("output", "")),
+                ]
+            )
+
+        if action == "stop":
+            target_id = self._resolve_bash_target_session_id(session_key, parts[1] if len(parts) > 1 else "")
+            if not target_id:
+                return "No active bash job found for this session."
+            result = process_registry.kill_process(target_id)
+            if self._get_bash_jobs().get(session_key) == target_id:
+                self._get_bash_jobs().pop(session_key, None)
+            if result.get("status") in {"killed", "already_exited"}:
+                return f"🛑 Bash job `{target_id}` stopped."
+            return f"❌ Failed to stop bash job `{target_id}`: {result.get('error') or result.get('status')}"
+
+        current_job_id = self._resolve_bash_target_session_id(session_key, "")
+        if current_job_id:
+            return (
+                "A bash job is already running for this session.\n\n"
+                f"**Session ID:** `{current_job_id}`\n"
+                "Use `/bash poll` to inspect it or `/bash stop` to terminate it first."
+            )
+
+        command = raw_args
+        result = self._run_bash_process(
+            source=target_source,
+            session_key=session_key,
+            command=command,
+            force=False,
+        )
+
+        if str(result.get("status") or "") == "approval_required":
+            approval_id = self._store_pending_bash_approval(
+                session_key=session_key,
+                command=command,
+                approval_payload=result,
+                on_approve=lambda _decision: self._resume_bash_after_approval(
+                    source=target_source,
+                    session_key=session_key,
+                    command=command,
+                ),
+            )
+            if target_source.platform == Platform.DISCORD:
+                approval_adapter = self.adapters.get(Platform.DISCORD)
+                if approval_adapter and hasattr(approval_adapter, "send_exec_approval"):
+                    try:
+                        await approval_adapter.send_exec_approval(
+                            target_source.chat_id,
+                            command,
+                            approval_id,
+                        )
+                    except Exception as approval_error:
+                        logger.debug("Discord exec approval UI failed for /bash: %s", approval_error)
+            return (
+                f"⚠️ Bash command requires approval (`{approval_id}`).\n\n"
+                f"```\n{command}\n```\n\n"
+                f"Use {self._approval_usage_text()} or the Discord approval buttons."
+            )
+
+        return self._format_bash_result(
+            session_key=session_key,
+            command=command,
+            result=result,
         )
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
@@ -5369,13 +6126,14 @@ class GatewayRunner:
             user_config = _load_gateway_config()
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
+            self._apply_runtime_debug_overrides()
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._load_reasoning_config()
+            reasoning_config = self._get_effective_reasoning_config()
             self._reasoning_config = reasoning_config
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
@@ -5646,8 +6404,7 @@ class GatewayRunner:
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / "config.yaml"
-        self._reasoning_config = self._load_reasoning_config()
-        self._show_reasoning = self._load_show_reasoning()
+        self._apply_runtime_debug_overrides()
 
         def _save_config_key(key_path: str, value):
             """Save a dot-separated key to config.yaml."""
@@ -5690,11 +6447,13 @@ class GatewayRunner:
         if args in ("show", "on"):
             self._show_reasoning = True
             _save_config_key("display.show_reasoning", True)
+            self._apply_runtime_debug_overrides()
             return "🧠 ✓ Reasoning display: **ON**\nModel thinking will be shown before each response."
 
         if args in ("hide", "off"):
             self._show_reasoning = False
             _save_config_key("display.show_reasoning", False)
+            self._apply_runtime_debug_overrides()
             return "🧠 ✓ Reasoning display: **OFF**"
 
         # Effort level change
@@ -5712,8 +6471,10 @@ class GatewayRunner:
 
         self._reasoning_config = parsed
         if _save_config_key("agent.reasoning_effort", effort):
+            self._apply_runtime_debug_overrides()
             return f"🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
         else:
+            self._apply_runtime_debug_overrides()
             return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
 
     async def _handle_yolo_command(self, event: MessageEvent) -> str:
@@ -5790,7 +6551,7 @@ class GatewayRunner:
     async def _handle_think_command(self, event: MessageEvent) -> str:
         """Handle /think command — reasoning effort only, without display toggles."""
         args = event.get_command_args().strip().lower()
-        self._reasoning_config = self._load_reasoning_config()
+        self._apply_runtime_debug_overrides()
 
         if not args:
             rc = self._reasoning_config
@@ -6683,7 +7444,7 @@ class GatewayRunner:
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
-        notify_mode = self._load_background_notifications_mode()
+        notify_mode = self._get_effective_background_notifications_mode()
 
         logger.debug("Process watcher started: %s (every %ss, notify=%s)",
                       session_id, interval, notify_mode)
@@ -7097,9 +7858,10 @@ class GatewayRunner:
                     "tools": [],
                 }
 
+            self._apply_runtime_debug_overrides()
             pr = self._provider_routing
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
-            reasoning_config = self._load_reasoning_config()
+            reasoning_config = self._get_effective_reasoning_config()
             self._reasoning_config = reasoning_config
             # Set up streaming consumer if enabled
             _stream_consumer = None

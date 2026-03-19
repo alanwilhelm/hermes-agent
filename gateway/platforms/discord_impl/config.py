@@ -85,9 +85,11 @@ def load_policy_config(
     config: Any | None = None,
     *,
     env: Mapping[str, str] | None = None,
+    overrides: Mapping[str, Any] | None = None,
 ) -> DiscordPolicyConfig:
     """Load a typed Discord policy snapshot from config.extra with env fallback."""
     env_map = env or os.environ
+    override_map = overrides or {}
     extra = getattr(config, "extra", None)
     if not isinstance(extra, dict):
         extra = {}
@@ -111,6 +113,17 @@ def load_policy_config(
     auto_thread = extra.get("auto_thread")
     if auto_thread is None:
         auto_thread = env_map.get("DISCORD_AUTO_THREAD")
+
+    if "allowed_users" in override_map:
+        allowed_users = override_map["allowed_users"]
+    if "allow_bots" in override_map:
+        bot_filter_policy = override_map["allow_bots"]
+    if "free_response_channels" in override_map:
+        free_response_channels = override_map["free_response_channels"]
+    if "require_mention" in override_map:
+        require_mention = override_map["require_mention"]
+    if "auto_thread" in override_map:
+        auto_thread = override_map["auto_thread"]
 
     return DiscordPolicyConfig(
         allowed_users=parse_allowed_users(allowed_users),
