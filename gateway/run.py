@@ -236,6 +236,15 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.command_catalog import (
+    build_session_export_html,
+    format_yaml_block,
+    load_raw_user_config,
+    read_config_or_env_value,
+    resolve_export_path,
+    unset_config_or_env_value,
+    write_config_or_env_value,
+)
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -1011,6 +1020,70 @@ class GatewayRunner:
         if name:
             return f"{platform}:{name} (`{chat_id}`)"
         return f"{platform} home channel (`{chat_id}`)"
+
+    @staticmethod
+    def _split_command_args(raw: str, *, max_parts: int | None = None) -> list[str]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            parts = text.split()
+        if max_parts is None or len(parts) <= max_parts:
+            return parts
+        head = parts[: max_parts - 1]
+        tail = " ".join(parts[max_parts - 1 :]).strip()
+        return [*head, tail]
+
+    @staticmethod
+    def _normalize_skill_name(raw: str) -> str:
+        return str(raw or "").strip().lower().replace(" ", "-").replace("_", "-").lstrip("/")
+
+    @staticmethod
+    def _parity_blocker_text(command: str, plan_id: str, detail: str) -> str:
+        return (
+            f"⚠️ `/{command}` is still blocked in Hermes parity work.\n\n"
+            f"**Blocked by:** `{plan_id}`\n"
+            f"**Reason:** {detail}"
+        )
+
+    def _prepare_skill_command(
+        self,
+        event: MessageEvent,
+        *,
+        task_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Rewrite `/skill` into the underlying skill invocation message."""
+        args_text = event.get_command_args().strip()
+        parts = self._split_command_args(args_text, max_parts=2)
+        if not parts:
+            from agent.skill_commands import get_skill_commands
+
+            skill_cmds = get_skill_commands()
+            if not skill_cmds:
+                return None, "No skill commands are installed."
+            lines = ["⚡ **Installed Skills**", ""]
+            for name, payload in sorted(skill_cmds.items()):
+                lines.append(f"`{name}` — {payload.get('description', 'Skill command')}")
+            lines.append("")
+            lines.append("Usage: `/skill <name> [input]`")
+            return None, "\n".join(lines)
+
+        from agent.skill_commands import build_skill_invocation_message
+
+        skill_name = self._normalize_skill_name(parts[0])
+        user_instruction = parts[1] if len(parts) > 1 else ""
+        cmd_key = f"/{skill_name}"
+        prepared = build_skill_invocation_message(
+            cmd_key,
+            user_instruction,
+            task_id=task_id,
+        )
+        if not prepared:
+            return None, f"Unknown skill `{skill_name}`. Use `/skill` to list installed skills."
+        event.text = prepared
+        return prepared, None
 
     def _schedule_gateway_restart(self, delay_seconds: float = 1.5) -> None:
         async def _restart_later():
@@ -2361,6 +2434,12 @@ class GatewayRunner:
         if canonical == "commands":
             return await self._handle_commands_command(event)
 
+        if canonical == "context":
+            return await self._handle_context_command(event)
+
+        if canonical == "export-session":
+            return await self._handle_export_session_command(event)
+
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
@@ -2384,6 +2463,15 @@ class GatewayRunner:
 
         if canonical == "approve":
             return await self._handle_approve_command(event)
+
+        if canonical == "allowlist":
+            return await self._handle_allowlist_command(event)
+
+        if canonical == "config":
+            return await self._handle_config_command(event)
+
+        if canonical == "debug":
+            return await self._handle_debug_command(event)
 
         if canonical == "stop":
             return await self._handle_stop_command(event)
@@ -2443,6 +2531,9 @@ class GatewayRunner:
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
 
+        if canonical == "compact":
+            return await self._handle_compress_command(event)
+
         if canonical == "compress":
             return await self._handle_compress_command(event)
 
@@ -2460,6 +2551,16 @@ class GatewayRunner:
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "skill":
+            try:
+                _prepared, error = self._prepare_skill_command(event, task_id=_quick_key)
+                if error:
+                    return error
+                canonical = None
+            except Exception as e:
+                logger.exception("Failed to prepare /skill command")
+                return f"Failed to invoke skill: {e}"
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -2496,6 +2597,41 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical == "subagents":
+            return self._parity_blocker_text(
+                "subagents",
+                "0028",
+                "Hermes still lacks a gateway-native sub-agent runtime registry and control plane.",
+            )
+
+        if canonical == "kill":
+            return self._parity_blocker_text(
+                "kill",
+                "0028",
+                "Sub-agent kill control depends on the same missing gateway-native sub-agent runtime.",
+            )
+
+        if canonical == "steer":
+            return self._parity_blocker_text(
+                command,
+                "0028",
+                "Sub-agent steering is blocked until Hermes exposes a gateway-native sub-agent control plane.",
+            )
+
+        if canonical == "acp":
+            return self._parity_blocker_text(
+                "acp",
+                "0028",
+                "ACP session management is not wired into the gateway command runtime yet.",
+            )
+
+        if canonical == "bash":
+            return self._parity_blocker_text(
+                "bash",
+                "0028",
+                "A dedicated gateway bash command surface and authorization model have not been implemented yet.",
+            )
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -3800,6 +3936,106 @@ class GatewayRunner:
             approval_id=approval_id,
             source=self._command_target_source_for_event(event),
         )
+
+    async def _handle_allowlist_command(self, event: MessageEvent) -> str:
+        """Handle /allowlist command - inspect or edit command approval patterns."""
+        import tools.approval as approval_mod
+
+        raw_args = event.get_command_args().strip()
+        parts = self._split_command_args(raw_args, max_parts=2)
+        mode = (parts[0] if parts else "list").strip().lower()
+        entry = parts[1].strip() if len(parts) > 1 else ""
+
+        if mode not in {"list", "add", "remove"}:
+            return (
+                f"⚠️ Unknown allowlist action: `{mode}`\n\n"
+                "Use `/allowlist [list|add|remove] [entry]`"
+            )
+
+        patterns = set(approval_mod.load_permanent_allowlist())
+        if mode == "list":
+            if not patterns:
+                return "No permanently approved command patterns are stored."
+            lines = ["🛡️ **Command Allowlist**", ""]
+            for pattern in sorted(patterns):
+                lines.append(f"• `{pattern}`")
+            return "\n".join(lines)
+
+        if not entry:
+            return f"Usage: `/allowlist {mode} <entry>`"
+
+        if mode == "add":
+            patterns.add(entry)
+            approval_mod.load_permanent(patterns)
+            approval_mod.save_permanent_allowlist(patterns)
+            return f"✅ Added `{entry}` to the command allowlist."
+
+        if entry not in patterns:
+            return f"`{entry}` is not in the command allowlist."
+        patterns.remove(entry)
+        approval_mod._permanent_approved = set(patterns)
+        approval_mod.save_permanent_allowlist(patterns)
+        return f"🗑️ Removed `{entry}` from the command allowlist."
+
+    async def _handle_config_command(self, event: MessageEvent) -> str:
+        """Handle /config command - inspect or update on-disk Hermes config."""
+        raw_args = event.get_command_args().strip()
+        parts = self._split_command_args(raw_args, max_parts=3)
+        mode = (parts[0] if parts else "show").strip().lower()
+        key = parts[1].strip() if len(parts) > 1 else ""
+        value = parts[2].strip() if len(parts) > 2 else ""
+
+        if mode == "show":
+            if key:
+                try:
+                    kind, resolved = read_config_or_env_value(key)
+                except KeyError:
+                    return f"`{key}` is not set."
+                return f"📄 **Config Show** (`{kind}`)\n\n`{key}`\n{format_yaml_block(resolved)}"
+            raw_config = load_raw_user_config()
+            return (
+                "📄 **Hermes Config (raw user file)**\n\n"
+                f"{format_yaml_block(raw_config or {})}"
+            )
+
+        if mode == "get":
+            if not key:
+                return "Usage: `/config get <key>`"
+            try:
+                kind, resolved = read_config_or_env_value(key)
+            except KeyError:
+                return f"`{key}` is not set."
+            return f"📄 **Config Value** (`{kind}`)\n\n`{key}`\n{format_yaml_block(resolved)}"
+
+        if mode == "set":
+            if not key or not value:
+                return "Usage: `/config set <key> <value>`"
+            kind, stored_value, path = write_config_or_env_value(key, value)
+            return (
+                f"✅ Updated `{key}` in `{path}` (`{kind}`)\n\n"
+                f"{format_yaml_block(stored_value)}"
+            )
+
+        if mode == "unset":
+            if not key:
+                return "Usage: `/config unset <key>`"
+            kind, removed, path = unset_config_or_env_value(key)
+            if not removed:
+                return f"`{key}` is not set."
+            return f"🗑️ Removed `{key}` from `{path}` (`{kind}`)."
+
+        return (
+            f"⚠️ Unknown config action: `{mode}`\n\n"
+            "Use `/config [show|get|set|unset] [key] [value]`"
+        )
+
+    async def _handle_debug_command(self, event: MessageEvent) -> str:
+        """Handle /debug command - report the remaining parity blocker honestly."""
+        return self._parity_blocker_text(
+            "debug",
+            "0027",
+            "Hermes does not yet have a gateway-wide runtime override layer that can safely overlay live config reads.",
+        )
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
@@ -4224,6 +4460,86 @@ class GatewayRunner:
             lines.append("_(session only -- add `--global` to persist)_")
 
         return "\n".join(lines)
+
+    async def _handle_context_command(self, event: MessageEvent) -> str:
+        """Handle /context command - inspect the current transcript and prompt context."""
+        mode = (event.get_command_args().strip() or "list").lower()
+        if mode not in {"list", "detail", "json"}:
+            return (
+                f"⚠️ Unknown context mode: `{mode}`\n\n"
+                "Use `/context [list|detail|json]`"
+            )
+
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        if self._session_source_for_event(event).platform == Platform.DISCORD:
+            from gateway.platforms.discord_impl import runtime_views
+
+            snapshot = runtime_views.collect_discord_context_snapshot(self, event)
+            return runtime_views.render_discord_context(snapshot, mode)
+
+        role_counts: dict[str, int] = {}
+        for item in history:
+            role = str(item.get("role") or "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        lines = [
+            "🧠 **Hermes Context**",
+            "",
+            f"• Session ID: `{session_entry.session_id}`",
+            f"• Session Key: `{session_entry.session_key}`",
+            f"• Messages: {len(history)}",
+            f"• Roles: {', '.join(f'{k}={v}' for k, v in sorted(role_counts.items())) or 'none'}",
+        ]
+        if mode == "detail":
+            preview = history[-5:]
+            lines.extend(["", "```json", json.dumps(preview, indent=2, ensure_ascii=False), "```"])
+        elif mode == "json":
+            payload = {
+                "session_id": session_entry.session_id,
+                "session_key": session_entry.session_key,
+                "message_count": len(history),
+                "role_counts": role_counts,
+            }
+            return f"```json\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n```"
+        return "\n".join(lines)
+
+    async def _handle_export_session_command(self, event: MessageEvent) -> str:
+        """Handle /export-session command - write a session export to disk."""
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        from gateway.platforms.discord_impl import runtime_views
+
+        snapshot = runtime_views.collect_discord_context_snapshot(self, event)
+        export_payload = {
+            "session": {
+                "session_id": session_entry.session_id,
+                "session_key": session_entry.session_key,
+                "source": target_source.to_dict(),
+                "current_model": snapshot.current_model,
+                "current_provider": snapshot.current_provider,
+                "connected_platforms": list(snapshot.connected_platforms),
+            },
+            "context_prompt": snapshot.context_prompt,
+            "messages": history,
+        }
+        cwd = os.environ.get("TERMINAL_CWD") or os.environ.get("MESSAGING_CWD") or os.getcwd()
+        raw_path = event.get_command_args().strip()
+        export_path = resolve_export_path(raw_path, cwd, session_id=session_entry.session_id)
+        if export_path.suffix.lower() == ".json":
+            export_path.write_text(json.dumps(export_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            mode = "JSON"
+        else:
+            export_path.write_text(build_session_export_html(export_payload), encoding="utf-8")
+            mode = "HTML"
+        return (
+            f"📦 Exported the current session to `{export_path}`\n\n"
+            f"• Format: {mode}\n"
+            f"• Messages: {len(history)}\n"
+            f"• Session ID: `{session_entry.session_id}`"
+        )
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami command - show the sender and routing identity Hermes sees."""
@@ -6100,9 +6416,10 @@ class GatewayRunner:
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context."""
-        source = event.source
+        source = self._command_target_source_for_event(event)
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
+        instructions = event.get_command_args().strip()
 
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
@@ -6139,7 +6456,7 @@ class GatewayRunner:
             loop = asyncio.get_event_loop()
             compressed, _ = await loop.run_in_executor(
                 None,
-                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens)
+                lambda: tmp_agent._compress_context(msgs, instructions, approx_tokens=approx_tokens),
             )
 
             # _compress_context already calls end_session() on the old session
@@ -6159,10 +6476,13 @@ class GatewayRunner:
             new_count = len(compressed)
             new_tokens = estimate_messages_tokens_rough(compressed)
 
-            return (
+            result = (
                 f"🗜️ Compressed: {original_count} → {new_count} messages\n"
                 f"~{approx_tokens:,} → ~{new_tokens:,} tokens"
             )
+            if instructions:
+                result += f"\nPreserved guidance: `{instructions[:160]}`"
+            return result
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return f"Compression failed: {e}"
@@ -6533,111 +6853,7 @@ class GatewayRunner:
             logger.warning("MCP reload failed: %s", e)
             return f"❌ MCP reload failed: {e}"
 
-    # ------------------------------------------------------------------
-    # /approve & /deny — explicit dangerous-command approval
-    # ------------------------------------------------------------------
-
-    _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
-
-    async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /approve command — unblock waiting agent thread(s).
-
-        The agent thread(s) are blocked inside tools/approval.py waiting for
-        the user to respond.  This handler signals the event so the agent
-        resumes and the terminal_tool executes the command inline — the same
-        flow as the CLI's synchronous input() approval.
-
-        Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
-
-        Usage:
-            /approve              — approve oldest pending command once
-            /approve all          — approve ALL pending commands at once
-            /approve session      — approve oldest + remember for session
-            /approve all session  — approve all + remember for session
-            /approve always       — approve oldest + remember permanently
-            /approve all always   — approve all + remember permanently
-        """
-        source = event.source
-        session_key = self._session_key_for_source(source)
-
-        from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
-        )
-
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
-            return "No pending command to approve."
-
-        # Parse args: support "all", "all session", "all always", "session", "always"
-        args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
-
-        if any(a in ("always", "permanent", "permanently") for a in remaining):
-            choice = "always"
-            scope_msg = " (pattern approved permanently)"
-        elif any(a in ("session", "ses") for a in remaining):
-            choice = "session"
-            scope_msg = " (pattern approved for this session)"
-        else:
-            choice = "once"
-            scope_msg = ""
-
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
-        if not count:
-            return "No pending command to approve."
-
-        # Resume typing indicator — agent is about to continue processing.
-        _adapter = self.adapters.get(source.platform)
-        if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
-
-        count_msg = f" ({count} commands)" if count > 1 else ""
-        logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
-        return f"✅ Command{'s' if count > 1 else ''} approved{scope_msg}{count_msg}. The agent is resuming..."
-
-    async def _handle_deny_command(self, event: MessageEvent) -> str:
-        """Handle /deny command — reject pending dangerous command(s).
-
-        Signals blocked agent thread(s) with a 'deny' result so they receive
-        a definitive BLOCKED message, same as the CLI deny flow.
-
-        ``/deny`` denies the oldest; ``/deny all`` denies everything.
-        """
-        source = event.source
-        session_key = self._session_key_for_source(source)
-
-        from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
-        )
-
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return "❌ Command denied (approval was stale)."
-            return "No pending command to deny."
-
-        args = event.get_command_args().strip().lower()
-        resolve_all = "all" in args
-
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
-        if not count:
-            return "No pending command to deny."
-
-        # Resume typing indicator — agent continues (with BLOCKED result).
-        _adapter = self.adapters.get(source.platform)
-        if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
-
-        count_msg = f" ({count} commands)" if count > 1 else ""
-        logger.info("User denied %d dangerous command(s) via /deny", count)
-        return f"❌ Command{'s' if count > 1 else ''} denied{count_msg}."
-
-    # Platforms where /update is allowed.  ACP, API server, and webhooks are
+    # Platforms where /update is allowed. ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
