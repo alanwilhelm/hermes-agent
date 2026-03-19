@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from gateway.platforms.discord_impl import components as discord_components
 from gateway.platforms.discord_impl import native_commands
 
 try:
@@ -24,16 +25,60 @@ def build_slash_event(adapter: Any, interaction: discord.Interaction, text: str)
     return native_commands.build_slash_event(adapter, interaction, text)
 
 
+def create_component_runtime() -> discord_components.DiscordComponentRuntime:
+    """Create a generic Discord component runtime."""
+    return discord_components.DiscordComponentRuntime()
+
+
 if DISCORD_AVAILABLE:
 
-    class ExecApprovalView(discord.ui.View):
-        """Interactive button view for exec approval of dangerous commands."""
+    class ExecApprovalView(discord_components.ManagedComponentView):
+        """Interactive exec approval view built on the generic component runtime."""
 
-        def __init__(self, approval_id: str, allowed_user_ids: set):
-            super().__init__(timeout=300)
+        def __init__(
+            self,
+            approval_id: str,
+            allowed_user_ids: set,
+            runtime: discord_components.DiscordComponentRuntime | None = None,
+        ):
+            self._runtime = runtime or create_component_runtime()
+            super().__init__(self._runtime, timeout=300)
             self.approval_id = approval_id
             self.allowed_user_ids = allowed_user_ids
             self.resolved = False
+            self.add_button(
+                discord_components.DiscordButtonSpec(
+                    label="Allow Once",
+                    style="success",
+                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
+                    handler=lambda invocation: self.allow_once(
+                        invocation.interaction,
+                        invocation.component,
+                    ),
+                )
+            )
+            self.add_button(
+                discord_components.DiscordButtonSpec(
+                    label="Always Allow",
+                    style="primary",
+                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
+                    handler=lambda invocation: self.allow_always(
+                        invocation.interaction,
+                        invocation.component,
+                    ),
+                )
+            )
+            self.add_button(
+                discord_components.DiscordButtonSpec(
+                    label="Deny",
+                    style="danger",
+                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
+                    handler=lambda invocation: self.deny(
+                        invocation.interaction,
+                        invocation.component,
+                    ),
+                )
+            )
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized."""
@@ -77,19 +122,16 @@ if DISCORD_AVAILABLE:
             except ImportError:
                 pass
 
-        @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
             await self._resolve(interaction, "allow_once", discord.Color.green())
 
-        @discord.ui.button(label="Always Allow", style=discord.ButtonStyle.blurple)
         async def allow_always(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
             await self._resolve(interaction, "allow_always", discord.Color.blue())
 
-        @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
         async def deny(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
