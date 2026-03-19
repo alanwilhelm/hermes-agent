@@ -2529,6 +2529,12 @@ class GatewayRunner:
     
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
+        if self._session_source_for_event(event).platform == Platform.DISCORD:
+            from gateway.platforms.discord_impl import runtime_views
+
+            snapshot = runtime_views.collect_discord_status_snapshot(self, event)
+            return runtime_views.render_discord_status(snapshot)
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         
@@ -2569,6 +2575,11 @@ class GatewayRunner:
     
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
+        if self._session_source_for_event(event).platform == Platform.DISCORD:
+            from gateway.platforms.discord_impl import runtime_views
+
+            return runtime_views.render_discord_help()
+
         from hermes_cli.commands import gateway_help_lines
         lines = [
             "📖 **Hermes Commands**\n",
@@ -2587,6 +2598,11 @@ class GatewayRunner:
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         """Handle /commands command - show the full gateway command catalog."""
+        if self._session_source_for_event(event).platform == Platform.DISCORD:
+            from gateway.platforms.discord_impl import runtime_views
+
+            return runtime_views.render_discord_commands()
+
         from hermes_cli.commands import gateway_help_lines
 
         return "\n".join([
@@ -2597,6 +2613,12 @@ class GatewayRunner:
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami command - show the sender and routing identity Hermes sees."""
+        if self._session_source_for_event(event).platform == Platform.DISCORD:
+            from gateway.platforms.discord_impl import runtime_views
+
+            snapshot = runtime_views.collect_discord_whoami_snapshot(self, event)
+            return runtime_views.render_discord_whoami(snapshot)
+
         source = event.source
         lines = [
             "👤 **Hermes Sees You As**",

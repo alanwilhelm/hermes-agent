@@ -295,6 +295,29 @@ def gateway_help_lines() -> list[str]:
     return lines
 
 
+def gateway_command_defs() -> list[CommandDef]:
+    """Return gateway-available command definitions in registry order."""
+    return [cmd for cmd in COMMAND_REGISTRY if not cmd.cli_only]
+
+
+def gateway_commands_by_category() -> list[tuple[str, tuple[CommandDef, ...]]]:
+    """Return gateway commands grouped by category in registry order."""
+    grouped: dict[str, list[CommandDef]] = {}
+    category_order: list[str] = []
+    for cmd in gateway_command_defs():
+        if cmd.category not in grouped:
+            grouped[cmd.category] = []
+            category_order.append(cmd.category)
+        grouped[cmd.category].append(cmd)
+    return [(category, tuple(grouped[category])) for category in category_order]
+
+
+def format_gateway_command_signature(cmd: CommandDef) -> str:
+    """Return a formatted gateway command signature."""
+    args = f" {cmd.args_hint}" if cmd.args_hint else ""
+    return f"/{cmd.name}{args}"
+
+
 def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
