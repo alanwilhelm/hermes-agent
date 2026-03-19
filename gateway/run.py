@@ -1902,7 +1902,9 @@ class GatewayRunner:
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
-        
+
+        if canonical in {"model", "models"}:
+            return await self._handle_model_command(event)
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
 
@@ -3236,6 +3238,434 @@ class GatewayRunner:
         if source.chat_topic:
             lines.append(f"**Chat Topic:** {source.chat_topic}")
         return "\n".join(lines)
+
+    def _load_current_model_selection(self) -> dict[str, Any]:
+        """Resolve the configured model/provider from config plus runtime env."""
+        import yaml
+        from hermes_cli.models import normalize_provider
+
+        config_path = _hermes_home / "config.yaml"
+        current_model = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
+        current_provider = "openrouter"
+
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, str):
+                    current_model = model_cfg
+                elif isinstance(model_cfg, dict):
+                    current_model = model_cfg.get("default", current_model)
+                    current_provider = model_cfg.get("provider", current_provider)
+        except Exception:
+            pass
+
+        current_provider = normalize_provider(current_provider)
+        if current_provider == "auto":
+            try:
+                from hermes_cli.auth import resolve_provider as _resolve_provider
+
+                current_provider = _resolve_provider(current_provider)
+            except Exception:
+                current_provider = "openrouter"
+
+        if current_provider == "openrouter" and os.getenv("OPENAI_BASE_URL", "").strip():
+            current_provider = "custom"
+
+        return {
+            "config_path": config_path,
+            "current_model": current_model,
+            "current_provider": current_provider,
+        }
+
+    def _resolve_model_runtime_details(self, requested_provider: str) -> tuple[dict[str, Any], Optional[str]]:
+        """Return runtime provider details for the active model selection."""
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=requested_provider)
+            return runtime, None
+        except Exception as exc:
+            return {}, str(exc)
+
+    async def _respond_to_native_slash(
+        self,
+        event: MessageEvent,
+        content: str,
+    ) -> bool:
+        """Send an ephemeral response for Discord native slash commands."""
+        interaction = getattr(event, "raw_message", None)
+        if interaction is None:
+            return False
+
+        response = getattr(interaction, "response", None)
+        if response is not None and hasattr(response, "send_message"):
+            is_done = getattr(response, "is_done", None)
+            if not callable(is_done) or not is_done():
+                await response.send_message(content, ephemeral=True)
+                return True
+
+        followup = getattr(interaction, "followup", None)
+        if followup is not None and hasattr(followup, "send"):
+            await followup.send(content, ephemeral=True)
+            return True
+        return False
+
+    def _is_native_discord_slash(self, event: MessageEvent) -> bool:
+        metadata = getattr(event, "metadata", None) or {}
+        return bool(
+            event.source.platform == Platform.DISCORD
+            and isinstance(metadata, dict)
+            and metadata.get("is_native_slash")
+        )
+
+    def _render_model_catalog_response(self) -> str:
+        """Render the current model plus numbered catalog for the active provider."""
+        from hermes_cli.models import _get_custom_base_url, curated_models_for_provider, provider_label
+
+        state = self._load_current_model_selection()
+        current_model = state["current_model"]
+        current_provider = state["current_provider"]
+        provider_name = provider_label(current_provider)
+        lines = [
+            "🤖 **Model Catalog**",
+            "",
+            f"**Current model:** `{current_model}`",
+            f"**Provider:** {provider_name} (`{current_provider}`)",
+        ]
+        if self._effective_model:
+            lines.extend(
+                [
+                    f"**Active fallback:** `{self._effective_model}`",
+                    f"**Fallback provider:** {provider_label(self._effective_provider or 'unknown')}",
+                ]
+            )
+        if current_provider == "custom":
+            custom_url = _get_custom_base_url() or os.getenv("OPENAI_BASE_URL", "")
+            if custom_url:
+                lines.append(f"**Endpoint:** `{custom_url}`")
+        lines.append("")
+
+        curated = curated_models_for_provider(current_provider)
+        if curated:
+            lines.append(f"**Available models ({provider_name}):**")
+            for index, (model_id, desc) in enumerate(curated, start=1):
+                marker = " ← current" if model_id == current_model else ""
+                detail = f" — {desc}" if desc else ""
+                lines.append(f"{index}. `{model_id}`{detail}{marker}")
+            lines.append("")
+        else:
+            lines.extend(
+                [
+                    f"No curated model list is available for `{current_provider}` right now.",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "Use `/model <number>` to choose by index.",
+                "Use `/models` on Discord to open the interactive picker.",
+                "Use `/model provider:model-name` to switch providers.",
+                "Use `/model status` for runtime endpoint and auth details.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _render_model_status_response(self) -> str:
+        """Render detailed model/provider/runtime status."""
+        from hermes_cli.models import provider_label
+
+        state = self._load_current_model_selection()
+        current_model = state["current_model"]
+        current_provider = state["current_provider"]
+        runtime, runtime_error = self._resolve_model_runtime_details(current_provider)
+        runtime_provider = str(runtime.get("provider") or current_provider)
+        runtime_label = provider_label(runtime_provider)
+        api_key = str(runtime.get("api_key") or "").strip()
+        command = runtime.get("command")
+        lines = [
+            "🤖 **Model Status**",
+            "",
+            f"**Configured model:** `{current_model}`",
+            f"**Configured provider:** {provider_label(current_provider)} (`{current_provider}`)",
+        ]
+        if self._effective_model:
+            effective_provider = self._effective_provider or current_provider
+            lines.extend(
+                [
+                    f"**Active model:** `{self._effective_model}` (fallback)",
+                    f"**Active provider:** {provider_label(effective_provider)} (`{effective_provider}`)",
+                    f"**Primary model:** `{current_model}`",
+                ]
+            )
+        else:
+            lines.append(f"**Active model:** `{current_model}`")
+
+        if runtime_error:
+            lines.extend(
+                [
+                    "",
+                    f"⚠️ Runtime provider resolution failed: {runtime_error}",
+                ]
+            )
+            return "\n".join(lines)
+
+        lines.extend(
+            [
+                f"**Runtime provider:** {runtime_label} (`{runtime_provider}`)",
+                f"**API mode:** `{runtime.get('api_mode') or 'unknown'}`",
+                f"**Base URL:** `{runtime.get('base_url') or 'unknown'}`",
+                f"**Credentials:** {'configured ✓' if api_key or command else 'missing ⚠️'}",
+            ]
+        )
+        if command:
+            lines.append(f"**Transport command:** `{command}`")
+        source = runtime.get("source")
+        if source:
+            lines.append(f"**Credential source:** `{source}`")
+        return "\n".join(lines)
+
+    def _resolve_numbered_model(self, raw_index: str, current_provider: str) -> Optional[str]:
+        """Resolve `/model <number>` against the current provider catalog."""
+        from hermes_cli.models import curated_models_for_provider
+
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            return None
+        if index < 1:
+            return None
+        curated = curated_models_for_provider(current_provider)
+        if index > len(curated):
+            return None
+        return curated[index - 1][0]
+
+    async def _apply_model_selection(
+        self,
+        target_provider: str,
+        new_model: str,
+        user_id: Optional[str] = None,
+    ) -> str:
+        """Validate, persist, and activate a model/provider choice."""
+        import yaml
+        from hermes_cli.models import validate_requested_model, provider_label
+
+        state = self._load_current_model_selection()
+        current_provider = state["current_provider"]
+        config_path = state["config_path"]
+        provider_changed = target_provider != current_provider
+        runtime, runtime_error = self._resolve_model_runtime_details(
+            target_provider if provider_changed else current_provider
+        )
+        if provider_changed and runtime_error:
+            return f"⚠️ Could not resolve credentials for provider '{provider_label(target_provider)}': {runtime_error}"
+
+        api_key = str(runtime.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "")
+        base_url = str(runtime.get("base_url") or "https://openrouter.ai/api/v1")
+
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+            )
+        except Exception:
+            validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
+
+        if not validation.get("accepted"):
+            message = validation.get("message", "Invalid model")
+            tip = "\n\nUse `/model list` to see numbered models, `/provider` to see providers." if "Did you mean" not in message else ""
+            return f"⚠️ {message}{tip}"
+
+        if validation.get("persist"):
+            try:
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                if "model" not in user_config or not isinstance(user_config["model"], dict):
+                    user_config["model"] = {}
+                user_config["model"]["default"] = new_model
+                user_config["model"]["provider"] = target_provider
+                if base_url and "openrouter.ai" not in (base_url or ""):
+                    user_config["model"]["base_url"] = base_url
+                else:
+                    user_config["model"].pop("base_url", None)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
+            except Exception as exc:
+                return f"⚠️ Failed to save model change: {exc}"
+
+        os.environ["HERMES_MODEL"] = new_model
+        os.environ["HERMES_INFERENCE_PROVIDER"] = target_provider
+
+        try:
+            from gateway.platforms.discord_impl import model_picker as discord_model_picker
+
+            discord_model_picker.record_recent_model(user_id, target_provider, new_model)
+        except Exception:
+            pass
+
+        self._effective_model = None
+        self._effective_provider = None
+
+        warning = f"\n⚠️ {validation['message']}" if validation.get("message") else ""
+        persist_note = "saved to config" if validation.get("persist") else "this session only — will revert on restart"
+
+        is_custom_target = target_provider == "custom" or (
+            base_url
+            and "openrouter.ai" not in (base_url or "")
+            and ("localhost" in (base_url or "") or "127.0.0.1" in (base_url or ""))
+        )
+        custom_hint = ""
+        if is_custom_target:
+            endpoint = base_url or "custom endpoint"
+            custom_hint = f"\n**Endpoint:** `{endpoint}`"
+            if not provider_changed:
+                custom_hint += (
+                    "\n_To switch providers, use_ `/model provider:model`"
+                    "\n_e.g._ `/model openrouter:anthropic/claude-sonnet-4`"
+                )
+
+        return (
+            f"🤖 Model changed to `{new_model}` ({persist_note})\n"
+            f"**Provider:** {provider_label(target_provider)} (`{target_provider}`){warning}{custom_hint}\n"
+            "_(takes effect on next message)_"
+        )
+
+    async def _open_discord_model_picker(self, event: MessageEvent, command_name: str) -> str | None:
+        """Open the Discord-native interactive model picker."""
+        if not self._is_native_discord_slash(event):
+            return self._render_model_catalog_response()
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        interaction = getattr(event, "raw_message", None)
+        if adapter is None or interaction is None:
+            return self._render_model_catalog_response()
+
+        state = self._load_current_model_selection()
+        try:
+            from gateway.platforms.discord_impl import model_picker as discord_model_picker
+
+            await discord_model_picker.open_model_picker(
+                adapter=adapter,
+                interaction=interaction,
+                command_name=command_name,
+                user_id=str(event.source.user_id or ""),
+                current_provider=state["current_provider"],
+                current_model=state["current_model"],
+                apply_selection=self._apply_model_selection,
+            )
+        except Exception as exc:
+            logger.warning("Discord model picker failed; falling back to text response: %s", exc, exc_info=True)
+            return self._render_model_catalog_response()
+        return None
+
+    async def _handle_model_command(self, event: MessageEvent) -> str | None:
+        """Handle /model and /models commands."""
+        from hermes_cli.models import parse_model_input, detect_provider_for_model
+
+        command_name = (event.get_command() or "model").lower()
+        args = event.get_command_args().strip()
+        is_native_slash = self._is_native_discord_slash(event)
+        state = self._load_current_model_selection()
+        current_provider = state["current_provider"]
+
+        response: Optional[str]
+
+        lowered = args.lower()
+        if command_name == "models":
+            if is_native_slash:
+                return await self._open_discord_model_picker(event, command_name="models")
+            response = self._render_model_catalog_response()
+        elif not args:
+            if is_native_slash:
+                return await self._open_discord_model_picker(event, command_name="model")
+            response = self._render_model_catalog_response()
+        elif lowered == "status":
+            response = self._render_model_status_response()
+        elif lowered == "list":
+            response = self._render_model_catalog_response()
+        elif lowered == "custom":
+            import yaml
+            from hermes_cli.model_switch import switch_to_custom_provider
+
+            config_path = state["config_path"]
+            cust_result = switch_to_custom_provider()
+            if not cust_result.success:
+                response = f"⚠️ {cust_result.error_message}"
+            else:
+                try:
+                    user_config = {}
+                    if config_path.exists():
+                        with open(config_path, encoding="utf-8") as f:
+                            user_config = yaml.safe_load(f) or {}
+                    if "model" not in user_config or not isinstance(user_config["model"], dict):
+                        user_config["model"] = {}
+                    user_config["model"]["default"] = cust_result.model
+                    user_config["model"]["provider"] = "custom"
+                    user_config["model"]["base_url"] = cust_result.base_url
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
+                except Exception as exc:
+                    response = f"⚠️ Failed to save model change: {exc}"
+                else:
+                    os.environ["HERMES_MODEL"] = cust_result.model
+                    os.environ["HERMES_INFERENCE_PROVIDER"] = "custom"
+                    try:
+                        from gateway.platforms.discord_impl import model_picker as discord_model_picker
+
+                        discord_model_picker.record_recent_model(event.source.user_id, "custom", cust_result.model)
+                    except Exception:
+                        pass
+                    self._effective_model = None
+                    self._effective_provider = None
+                    response = (
+                        f"🤖 Model changed to `{cust_result.model}` (saved to config)\n"
+                        f"**Provider:** Custom (`custom`)\n"
+                        f"**Endpoint:** `{cust_result.base_url}`\n"
+                        "_Model auto-detected from endpoint. Takes effect on next message._"
+                    )
+        else:
+            numbered_model = self._resolve_numbered_model(args, current_provider)
+            if numbered_model:
+                response = await self._apply_model_selection(
+                    current_provider,
+                    numbered_model,
+                    user_id=event.source.user_id,
+                )
+            else:
+                target_provider, new_model = parse_model_input(args, current_provider)
+
+                # Detect custom/local provider — skip auto-detection to prevent
+                # silently accepting an OpenRouter model name on a localhost endpoint.
+                _resolved_base = ""
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider as _rtp
+                    _resolved_base = _rtp(requested=current_provider).get("base_url", "")
+                except Exception:
+                    pass
+                is_custom = current_provider == "custom" or (
+                    "localhost" in _resolved_base or "127.0.0.1" in _resolved_base
+                )
+
+                if target_provider == current_provider and not is_custom:
+                    detected = detect_provider_for_model(new_model, current_provider)
+                    if detected:
+                        target_provider, new_model = detected
+                response = await self._apply_model_selection(
+                    target_provider,
+                    new_model,
+                    user_id=event.source.user_id,
+                )
+
+        if is_native_slash and response:
+            await self._respond_to_native_slash(event, response)
+            return None
+        return response
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
         import yaml
