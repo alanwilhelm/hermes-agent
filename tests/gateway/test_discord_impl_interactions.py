@@ -15,6 +15,104 @@ class FakeView:
         self.timeout = timeout
         self.children = []
 
+    def add_item(self, item):
+        item.view = self
+        self.children.append(item)
+
+
+class FakeButton:
+    def __init__(
+        self,
+        *,
+        label=None,
+        style=None,
+        custom_id=None,
+        row=None,
+        disabled=False,
+        emoji=None,
+        url=None,
+    ):
+        self.label = label
+        self.style = style
+        self.custom_id = custom_id
+        self.row = row
+        self.disabled = disabled
+        self.emoji = emoji
+        self.url = url
+        self.view = None
+
+
+class FakeSelect:
+    def __init__(
+        self,
+        *,
+        placeholder=None,
+        min_values=1,
+        max_values=1,
+        options=None,
+        custom_id=None,
+        row=None,
+        disabled=False,
+    ):
+        self.placeholder = placeholder
+        self.min_values = min_values
+        self.max_values = max_values
+        self.options = list(options or [])
+        self.custom_id = custom_id
+        self.row = row
+        self.disabled = disabled
+        self.values = []
+        self.view = None
+
+
+class FakeUserSelect(FakeSelect):
+    pass
+
+
+class FakeRoleSelect(FakeSelect):
+    pass
+
+
+class FakeMentionableSelect(FakeSelect):
+    pass
+
+
+class FakeChannelSelect(FakeSelect):
+    pass
+
+
+class FakeModal:
+    def __init__(self, *, title=None, custom_id=None, timeout=None):
+        self.title = title
+        self.custom_id = custom_id
+        self.timeout = timeout
+        self.children = []
+
+    def add_item(self, item):
+        self.children.append(item)
+
+
+class FakeTextInput:
+    def __init__(
+        self,
+        *,
+        label,
+        placeholder=None,
+        default=None,
+        required=True,
+        min_length=None,
+        max_length=None,
+        style=None,
+    ):
+        self.label = label
+        self.placeholder = placeholder
+        self.default = default
+        self.required = required
+        self.min_length = min_length
+        self.max_length = max_length
+        self.style = style
+        self.value = default or ""
+
 
 class FakeEmbed:
     def __init__(self):
@@ -56,16 +154,34 @@ def _load_interactions_module():
     discord_mod.Embed = MagicMock
     discord_mod.ui = SimpleNamespace(
         View=FakeView,
+        Button=FakeButton,
+        Select=FakeSelect,
+        UserSelect=FakeUserSelect,
+        RoleSelect=FakeRoleSelect,
+        MentionableSelect=FakeMentionableSelect,
+        ChannelSelect=FakeChannelSelect,
+        Modal=FakeModal,
+        TextInput=FakeTextInput,
         button=lambda *a, **k: (lambda fn: fn),
-        Button=object,
     )
-    discord_mod.ButtonStyle = SimpleNamespace(green=1, blurple=2, red=3)
+    discord_mod.ButtonStyle = SimpleNamespace(
+        primary=1,
+        secondary=2,
+        success=3,
+        danger=4,
+        link=5,
+        green=3,
+        blurple=1,
+        red=4,
+    )
     discord_mod.Color = SimpleNamespace(
         green=lambda: "green",
         blue=lambda: "blue",
         red=lambda: "red",
         orange=lambda: "orange",
     )
+    discord_mod.SelectOption = lambda **kwargs: SimpleNamespace(**kwargs)
+    discord_mod.TextStyle = SimpleNamespace(short="short", paragraph="paragraph")
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
         choices=lambda **kwargs: (lambda fn: fn),
