@@ -61,6 +61,7 @@ from gateway.platforms.discord_impl import history as discord_history
 from gateway.platforms.discord_impl import intake as discord_intake
 from gateway.platforms.discord_impl import interactions as discord_interactions
 from gateway.platforms.discord_impl import messaging as discord_messaging
+from gateway.platforms.discord_impl import native_commands as discord_native_commands
 from gateway.platforms.discord_impl import permissions as discord_permissions
 from gateway.platforms.discord_impl import state as discord_state
 from gateway.platforms.discord_impl import threads as discord_threads
@@ -1822,6 +1823,10 @@ class DiscordAdapter(BasePlatformAdapter):
             if is_mentioned and self._client.user:
                 message.content = discord_intake.strip_mention(message.content, self._client.user.id)
 
+        inline_command, remaining_text = discord_native_commands.extract_inline_shortcut(
+            message.content
+        )
+
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -1979,6 +1984,23 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_message_id=str(message.reference.message_id) if message.reference else None,
             timestamp=message.created_at,
         )
+
+        if inline_command:
+            inline_event = MessageEvent(
+                text=f"/{inline_command}",
+                message_type=MessageType.COMMAND,
+                source=source,
+                raw_message=message,
+                message_id=str(message.id),
+                reply_to_message_id=event.reply_to_message_id,
+                timestamp=message.created_at,
+                metadata={"is_inline_shortcut": True},
+            )
+            await self.handle_message(inline_event)
+            if not remaining_text and not media_urls:
+                return
+            event.text = remaining_text
+            event.message_type = MessageType.TEXT
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
