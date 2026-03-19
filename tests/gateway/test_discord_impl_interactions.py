@@ -185,6 +185,7 @@ def _load_interactions_module():
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
         choices=lambda **kwargs: (lambda fn: fn),
+        autocomplete=lambda **kwargs: (lambda fn: fn),
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
     )
     discord_mod.opus = SimpleNamespace(
@@ -216,6 +217,8 @@ def _build_adapter():
         _build_slash_event=MagicMock(return_value=SimpleNamespace()),
         handle_message=AsyncMock(),
         _handle_thread_create_slash=AsyncMock(),
+        _resolve_exec_approval=AsyncMock(return_value="resolved"),
+        _component_runtime=interactions.create_component_runtime(),
     )
 
 
@@ -256,9 +259,11 @@ def test_register_slash_commands_registers_expected_names():
         "commands",
         "whoami",
         "id",
+        "approve",
         "model",
         "models",
         "reasoning",
+        "think",
         "personality",
         "retry",
         "undo",
@@ -274,6 +279,7 @@ def test_register_slash_commands_registers_expected_names():
         "insights",
         "reload-mcp",
         "voice",
+        "vc",
         "update",
         "thread",
     }
@@ -294,28 +300,64 @@ def test_extract_inline_shortcut_returns_none_for_plain_text():
 
 
 @pytest.mark.asyncio
+async def test_native_dispatch_opens_fallback_menu_for_missing_discrete_arg():
+    adapter = _build_adapter()
+    spec = next(spec for spec in interactions.native_commands.get_command_specs() if spec.name == "think")
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=42, display_name="Jezza"),
+        message=None,
+        response=SimpleNamespace(
+            edit_message=AsyncMock(),
+            send_message=AsyncMock(),
+            is_done=lambda: False,
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await interactions.native_commands._dispatch(adapter, interaction, spec, effort="")
+
+    interaction.response.send_message.assert_awaited_once()
+    args = interaction.response.send_message.await_args.args
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert "Choose `effort` for `/think`." == args[0]
+    assert kwargs["view"] is not None
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_autocomplete_filters_discrete_choices():
+    adapter = _build_adapter()
+    spec = next(spec for spec in interactions.native_commands.get_command_specs() if spec.name == "reasoning")
+    arg = spec.args[0]
+
+    result = await interactions.native_commands._autocomplete_choices(
+        adapter,
+        spec,
+        arg,
+        SimpleNamespace(),
+        "hi",
+    )
+
+    assert [choice.value for choice in result] == ["off", "hide", "high", "xhigh"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method_name", "expected_color", "expected_footer", "permanent_calls"),
+    ("method_name", "expected_color", "expected_footer"),
     [
-        ("allow_once", "green", "allow_once by Jezza", 0),
-        ("allow_always", "blue", "allow_always by Jezza", 1),
-        ("deny", "red", "deny by Jezza", 0),
+        ("allow_once", "green", "allow_once by Jezza"),
+        ("allow_always", "blue", "allow_always by Jezza"),
+        ("deny", "red", "deny by Jezza"),
     ],
 )
 async def test_exec_approval_view_button_callbacks_resolve_correctly(
-    monkeypatch,
     method_name,
     expected_color,
     expected_footer,
-    permanent_calls,
 ):
-    approve_permanent = MagicMock()
-    approval_mod = ModuleType("tools.approval")
-    approval_mod.approve_permanent = approve_permanent
-    monkeypatch.setitem(sys.modules, "tools.approval", approval_mod)
-
-    view = interactions.ExecApprovalView("approval-1", {"42"})
-    view.children = [SimpleNamespace(disabled=False), SimpleNamespace(disabled=False)]
+    adapter = _build_adapter()
+    view = interactions.create_exec_approval_view(adapter, "approval-1", {"42"})
     embed = FakeEmbed()
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=42, display_name="Jezza"),
@@ -324,22 +366,32 @@ async def test_exec_approval_view_button_callbacks_resolve_correctly(
             edit_message=AsyncMock(),
             send_message=AsyncMock(),
         ),
+        followup=SimpleNamespace(send=AsyncMock()),
     )
 
-    await getattr(view, method_name)(interaction, None)
+    button_labels = {
+        "allow_once": "Allow Once",
+        "allow_always": "Always Allow",
+        "deny": "Deny",
+    }
+    button = next(child for child in view.children if child.label == button_labels[method_name])
+    await button.callback(interaction)
 
-    assert view.resolved is True
     assert embed.color == expected_color
-    assert embed.footer_text == expected_footer
+    assert embed.footer_text == expected_footer.replace("_", "-")
     assert all(child.disabled for child in view.children)
     interaction.response.edit_message.assert_awaited_once_with(embed=embed, view=view)
-    assert approve_permanent.call_count == permanent_calls
+    interaction.followup.send.assert_awaited_once_with("resolved", ephemeral=True)
+    assert adapter._resolve_exec_approval.await_count == 1
+    decision = adapter._resolve_exec_approval.await_args.kwargs["decision"]
+    assert decision == expected_footer.split(" by ")[0].replace("_", "-")
+    assert adapter._resolve_exec_approval.await_args.kwargs["approval_id"] == "approval-1"
 
 
 @pytest.mark.asyncio
 async def test_exec_approval_view_rejects_unauthorized_user():
-    view = interactions.ExecApprovalView("approval-1", {"42"})
-    view.children = [SimpleNamespace(disabled=False)]
+    adapter = _build_adapter()
+    view = interactions.create_exec_approval_view(adapter, "approval-1", {"42"})
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=7, display_name="Mallory"),
         message=SimpleNamespace(embeds=[FakeEmbed()]),
@@ -349,11 +401,11 @@ async def test_exec_approval_view_rejects_unauthorized_user():
         ),
     )
 
-    await view.deny(interaction, None)
+    button = next(child for child in view.children if child.label == "Deny")
+    await button.callback(interaction)
 
-    assert view.resolved is False
     interaction.response.edit_message.assert_not_awaited()
     interaction.response.send_message.assert_awaited_once_with(
-        "You're not authorized to approve commands~",
+        "You're not authorized to use this interaction~",
         ephemeral=True,
     )

@@ -787,6 +787,122 @@ class GatewayRunner:
                 return session_source
         return event.source
 
+    def _command_target_source_for_event(self, event: MessageEvent) -> SessionSource:
+        """Resolve the command target source, falling back to the event source."""
+        metadata = getattr(event, "metadata", None)
+        if isinstance(metadata, dict):
+            target_source = metadata.get("command_target_source")
+            if isinstance(target_source, SessionSource):
+                return target_source
+        return event.source
+
+    @staticmethod
+    def _new_approval_id() -> str:
+        """Generate a short human-readable approval identifier."""
+        return f"appr-{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _normalize_approval_decision(raw: str) -> Optional[str]:
+        value = str(raw or "").strip().lower()
+        mapping = {
+            "allow-once": "allow-once",
+            "once": "allow-once",
+            "allow_once": "allow-once",
+            "yes": "allow-once",
+            "approve": "allow-once",
+            "allow-always": "allow-always",
+            "always": "allow-always",
+            "allow_always": "allow-always",
+            "deny": "deny",
+            "no": "deny",
+            "reject": "deny",
+            "cancel": "deny",
+            "show": "show",
+            "view": "show",
+            "full": "show",
+        }
+        return mapping.get(value)
+
+    def _find_pending_approval(
+        self,
+        *,
+        approval_id: Optional[str] = None,
+        source: Optional[SessionSource] = None,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Find a pending approval by explicit approval ID or source session."""
+        if approval_id:
+            for session_key, pending in self._pending_approvals.items():
+                if str(pending.get("approval_id") or "") == approval_id:
+                    return session_key, pending
+            return None, None
+
+        if source is None:
+            return None, None
+
+        session_key = self._session_key_for_source(source)
+        return session_key, self._pending_approvals.get(session_key)
+
+    def _approval_usage_text(self) -> str:
+        return "`/approve [id] <allow-once|allow-always|deny>`"
+
+    def _resolve_pending_approval(
+        self,
+        *,
+        decision: str,
+        approval_id: Optional[str] = None,
+        source: Optional[SessionSource] = None,
+    ) -> str:
+        """Resolve a pending approval by ID or source session."""
+        normalized = self._normalize_approval_decision(decision)
+        if normalized is None:
+            return (
+                f"⚠️ Unknown approval decision: `{decision}`\n\n"
+                f"Use {self._approval_usage_text()}"
+            )
+
+        session_key, pending = self._find_pending_approval(approval_id=approval_id, source=source)
+        if not session_key or not pending:
+            target = f"`{approval_id}`" if approval_id else "this chat"
+            return f"No pending approval found for {target}."
+
+        pending_id = str(pending.get("approval_id") or "")
+        command = str(pending.get("command") or "").strip()
+        pattern_keys = list(pending.get("pattern_keys") or [])
+        if not pattern_keys:
+            pattern_key = str(pending.get("pattern_key") or "").strip()
+            if pattern_key:
+                pattern_keys = [pattern_key]
+
+        if normalized == "show":
+            return (
+                f"⚠️ Pending approval `{pending_id}`\n\n"
+                f"```\n{command}\n```\n\n"
+                f"Use {self._approval_usage_text()}"
+            )
+
+        if normalized == "deny":
+            self._pending_approvals.pop(session_key, None)
+            return f"❌ Command denied (`{pending_id}`)."
+
+        import tools.approval as approval_mod
+        from tools.terminal_tool import terminal_tool
+
+        for pattern_key in pattern_keys:
+            approval_mod.approve_session(session_key, pattern_key)
+
+        if normalized == "allow-always":
+            for pattern_key in pattern_keys:
+                approval_mod.approve_permanent(pattern_key)
+            approval_mod.save_permanent_allowlist(approval_mod._permanent_approved)
+
+        self._pending_approvals.pop(session_key, None)
+        result = terminal_tool(command=command, force=True)
+        decision_label = "allow-always" if normalized == "allow-always" else "allow-once"
+        return (
+            f"✅ Command approved ({decision_label}) and executed (`{pending_id}`).\n\n"
+            f"```\n{result[:3500]}\n```"
+        )
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
 
@@ -1135,6 +1251,8 @@ class GatewayRunner:
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            if platform == Platform.DISCORD and hasattr(adapter, "_resolve_exec_approval"):
+                adapter._resolve_exec_approval = self._resolve_pending_approval
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -1899,7 +2017,10 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
-        
+
+        if canonical == "approve":
+            return await self._handle_approve_command(event)
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
 
@@ -1907,7 +2028,8 @@ class GatewayRunner:
             return await self._handle_model_command(event)
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
-
+        if canonical == "think":
+            return await self._handle_think_command(event)
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
 
@@ -2734,19 +2856,28 @@ class GatewayRunner:
                 import time as _time
                 pending = pop_pending(session_key)
                 if pending:
-                    pending["timestamp"] = _time.time()
+                    approval_id = str(pending.get("approval_id") or self._new_approval_id())
+                    pending["approval_id"] = approval_id
+                    pending["session_key"] = session_key
+                    pending.setdefault("created_at", datetime.now().isoformat())
                     self._pending_approvals[session_key] = pending
-                    # Append structured instructions so the user knows how to respond
-                    cmd_preview = pending.get("command", "")
-                    if len(cmd_preview) > 200:
-                        cmd_preview = cmd_preview[:200] + "..."
-                    approval_hint = (
-                        f"\n\n⚠️ **Dangerous command requires approval:**\n"
-                        f"```\n{cmd_preview}\n```\n"
-                        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                        f"for the session, or `/deny` to cancel."
+                    approval_note = (
+                        f"\n\nApproval ID: `{approval_id}`\n"
+                        f"Use {self._approval_usage_text()} or the Discord approval buttons."
                     )
-                    response = (response or "") + approval_hint
+                    response = f"{response}{approval_note}" if response else approval_note.strip()
+
+                    if source.platform == Platform.DISCORD:
+                        approval_adapter = self.adapters.get(Platform.DISCORD)
+                        if approval_adapter and hasattr(approval_adapter, "send_exec_approval"):
+                            try:
+                                await approval_adapter.send_exec_approval(
+                                    source.chat_id,
+                                    pending.get("command", ""),
+                                    approval_id,
+                                )
+                            except Exception as approval_error:
+                                logger.debug("Discord exec approval UI failed: %s", approval_error)
             except Exception as e:
                 logger.debug("Failed to check pending approvals: %s", e)
             
@@ -3119,6 +3250,53 @@ class GatewayRunner:
         ]
         
         return "\n".join(lines)
+
+    async def _handle_approve_command(self, event: MessageEvent) -> str:
+        """Handle /approve command for pending exec approvals."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            target_source = self._command_target_source_for_event(event)
+            _session_key, pending = self._find_pending_approval(source=target_source)
+            if not pending:
+                return "No pending approval found for this chat."
+            approval_id = str(pending.get("approval_id") or "unknown")
+            command = str(pending.get("command") or "").strip()
+            return (
+                f"⚠️ Pending approval `{approval_id}`\n\n"
+                f"```\n{command}\n```\n\n"
+                f"Use {self._approval_usage_text()}"
+            )
+
+        tokens = raw_args.split()
+        approval_id: Optional[str] = None
+        decision: Optional[str] = None
+
+        if len(tokens) == 1:
+            maybe_decision = self._normalize_approval_decision(tokens[0])
+            if maybe_decision:
+                decision = maybe_decision
+            else:
+                approval_id = tokens[0]
+        else:
+            first_decision = self._normalize_approval_decision(tokens[0])
+            second_decision = self._normalize_approval_decision(tokens[1])
+            if first_decision and not second_decision:
+                decision = first_decision
+                approval_id = tokens[1]
+            else:
+                approval_id = tokens[0]
+                decision = second_decision or self._normalize_approval_decision(tokens[1])
+
+        if approval_id and decision is None:
+            return self._resolve_pending_approval(decision="show", approval_id=approval_id)
+        if decision is None:
+            return f"Use {self._approval_usage_text()}"
+
+        return self._resolve_pending_approval(
+            decision=decision,
+            approval_id=approval_id,
+            source=self._command_target_source_for_event(event),
+        )
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
@@ -4847,6 +5025,46 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
+
+    async def _handle_think_command(self, event: MessageEvent) -> str:
+        """Handle /think command — reasoning effort only, without display toggles."""
+        args = event.get_command_args().strip().lower()
+        self._reasoning_config = self._load_reasoning_config()
+
+        if not args:
+            rc = self._reasoning_config
+            if rc is None:
+                level = "medium (default)"
+            elif rc.get("enabled") is False:
+                level = "off"
+            else:
+                level = rc.get("effort", "medium")
+            return (
+                "🧠 **Thinking Effort**\n\n"
+                f"**Current:** `{level}`\n\n"
+                "_Usage:_ `/think <off|minimal|low|medium|high|xhigh>`"
+            )
+
+        effort = "none" if args == "off" else args
+        if effort not in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            return (
+                f"⚠️ Unknown thinking level: `{args}`\n\n"
+                "**Valid levels:** off, minimal, low, medium, high, xhigh"
+            )
+
+        think_event = MessageEvent(
+            text=f"/reasoning {effort}",
+            source=event.source,
+            message_type=event.message_type,
+            raw_message=event.raw_message,
+            message_id=event.message_id,
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            metadata=event.metadata,
+        )
+        return await self._handle_reasoning_command(think_event)
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context."""

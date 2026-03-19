@@ -73,6 +73,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("status", "Show session info", "Session",
                gateway_only=True),
+    CommandDef("approve", "Resolve a pending exec approval", "Session",
+               gateway_only=True, args_hint="[id] [allow-once|allow-always|deny]"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("whoami", "Show the sender identity Hermes sees", "Session",
                gateway_only=True, aliases=("id",)),
@@ -104,10 +106,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide]",
                subcommands=("none", "low", "minimal", "medium", "high", "xhigh", "show", "hide", "on", "off")),
+    CommandDef("think", "Set reasoning effort quickly", "Configuration",
+               gateway_only=True, aliases=("thinking", "t"),
+               args_hint="[off|minimal|low|medium|high|xhigh]"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("voice", "Toggle voice mode", "Configuration",
-               args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
+               aliases=("vc",), args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
 
     # Tools & Skills
     CommandDef("tools", "Manage tools: /tools [list|disable|enable] [name...]", "Tools & Skills",

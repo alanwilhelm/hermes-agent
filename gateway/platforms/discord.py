@@ -426,6 +426,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_policy: Optional[discord_config.DiscordPolicyConfig] = None
         self._component_runtime = discord_interactions.create_component_runtime()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._resolve_exec_approval: Optional[Callable[..., Any]] = None
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -1880,7 +1881,8 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             embed.set_footer(text=f"Approval ID: {approval_id}")
 
-            view = discord_interactions.ExecApprovalView(
+            view = discord_interactions.create_exec_approval_view(
+                self,
                 approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
                 runtime=self._component_runtime,
