@@ -165,7 +165,7 @@ async def test_check_channel_permissions_returns_none_for_missing_channel():
 async def test_list_accessible_channels_filters_to_readable_channels_only():
     readable = _make_guild_channel(1, "general", can_read=True)
     hidden = _make_guild_channel(2, "private", can_read=False)
-    guild = SimpleNamespace(id=777, text_channels=[readable, hidden])
+    guild = SimpleNamespace(id=777, name="Hermes", text_channels=[readable, hidden])
     readable.guild = guild
     hidden.guild = guild
     client = _make_client(guilds=[guild])
@@ -173,9 +173,14 @@ async def test_list_accessible_channels_filters_to_readable_channels_only():
     result = await permissions.list_accessible_channels(client)
 
     assert result == [
-        permissions.ChannelPermissions(
+        permissions.AccessibleChannel(
             channel_id="1",
             channel_name="general",
+            guild_id="777",
+            guild_name="Hermes",
+            channel_kind="channel",
+            qualified_name="Hermes/general",
+            mention="<#1>",
             can_read=True,
             can_send=True,
             can_read_history=True,
@@ -190,8 +195,8 @@ async def test_list_accessible_channels_filters_to_readable_channels_only():
 
 @pytest.mark.asyncio
 async def test_list_accessible_channels_respects_guild_id_filter():
-    guild_one = SimpleNamespace(id=111, text_channels=[_make_guild_channel(1, "one")])
-    guild_two = SimpleNamespace(id=222, text_channels=[_make_guild_channel(2, "two")])
+    guild_one = SimpleNamespace(id=111, name="One", text_channels=[_make_guild_channel(1, "one")])
+    guild_two = SimpleNamespace(id=222, name="Two", text_channels=[_make_guild_channel(2, "two")])
     for guild in (guild_one, guild_two):
         for channel in guild.text_channels:
             channel.guild = guild
@@ -201,6 +206,36 @@ async def test_list_accessible_channels_respects_guild_id_filter():
 
     assert [channel.channel_id for channel in result] == ["2"]
     assert [channel.channel_name for channel in result] == ["two"]
+
+
+@pytest.mark.asyncio
+async def test_list_accessible_channels_includes_normalized_target_metadata():
+    guild = SimpleNamespace(id=777, name="Hermes", text_channels=[_make_guild_channel(1, "general")])
+    for channel in guild.text_channels:
+        channel.guild = guild
+    client = _make_client(guilds=[guild])
+
+    result = await permissions.list_accessible_channels(client)
+
+    assert result == [
+        permissions.AccessibleChannel(
+            channel_id="1",
+            channel_name="general",
+            guild_id="777",
+            guild_name="Hermes",
+            channel_kind="channel",
+            qualified_name="Hermes/general",
+            mention="<#1>",
+            can_read=True,
+            can_send=True,
+            can_read_history=True,
+            can_attach_files=True,
+            can_embed_links=True,
+            can_add_reactions=True,
+            can_manage_threads=False,
+            can_create_threads=True,
+        )
+    ]
 
 
 @pytest.mark.asyncio
