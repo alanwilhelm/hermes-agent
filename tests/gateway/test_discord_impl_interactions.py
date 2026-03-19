@@ -5,6 +5,8 @@ import sys
 
 import pytest
 
+from gateway.config import Platform
+from gateway.session import SessionSource
 from gateway.platforms.base import MessageType
 
 
@@ -93,7 +95,7 @@ interactions = _load_interactions_module()
 
 def _build_adapter():
     return SimpleNamespace(
-        build_source=lambda **kwargs: SimpleNamespace(**kwargs),
+        build_source=lambda **kwargs: SessionSource(platform=Platform.DISCORD, **kwargs),
         _run_simple_slash=AsyncMock(),
         _build_slash_event=MagicMock(return_value=SimpleNamespace()),
         handle_message=AsyncMock(),
@@ -120,6 +122,9 @@ def test_build_slash_event_constructs_message_event():
     assert event.source.chat_id == "123"
     assert event.source.chat_name == "Hermes / #general"
     assert event.source.chat_topic == "topic"
+    assert isinstance(event.metadata.get("session_source"), SessionSource)
+    assert event.metadata["session_source"].session_namespace == "slash:42"
+    assert event.metadata["command_target_source"].chat_id == "123"
 
 
 def test_register_slash_commands_registers_expected_names():
@@ -131,6 +136,9 @@ def test_register_slash_commands_registers_expected_names():
     assert set(tree.commands) == {
         "new",
         "reset",
+        "help",
+        "commands",
+        "whoami",
         "model",
         "reasoning",
         "personality",
@@ -151,6 +159,20 @@ def test_register_slash_commands_registers_expected_names():
         "update",
         "thread",
     }
+
+
+def test_extract_inline_shortcut_finds_first_supported_command():
+    command, remaining = interactions.native_commands.extract_inline_shortcut("hey /status please")
+
+    assert command == "status"
+    assert remaining == "hey please"
+
+
+def test_extract_inline_shortcut_returns_none_for_plain_text():
+    command, remaining = interactions.native_commands.extract_inline_shortcut("just chatting here")
+
+    assert command is None
+    assert remaining == "just chatting here"
 
 
 @pytest.mark.asyncio

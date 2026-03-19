@@ -76,6 +76,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("status", "Show session info", "Session",
                gateway_only=True),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
+    CommandDef("whoami", "Show the sender identity Hermes sees", "Session",
+               gateway_only=True, aliases=("id",)),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",

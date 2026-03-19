@@ -778,6 +778,15 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _session_source_for_event(self, event: MessageEvent) -> SessionSource:
+        """Resolve the session source for an event, honoring command-session overrides."""
+        metadata = getattr(event, "metadata", None)
+        if isinstance(metadata, dict):
+            session_source = metadata.get("session_source")
+            if isinstance(session_source, SessionSource):
+                return session_source
+        return event.source
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
 
@@ -1773,6 +1782,7 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        session_source = self._session_source_for_event(event)
 
         # Check if user is authorized
         if not self._is_user_authorized(source):
@@ -1846,6 +1856,7 @@ class GatewayRunner:
         # Special case: Telegram/photo bursts often arrive as multiple near-
         # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
         # let the adapter-level batching/queueing logic absorb them.
+        _quick_key = self._session_key_for_source(session_source)
 
         # Staleness eviction: detect leaked locks from hung/crashed handlers.
         # With inactivity-based timeout, active tasks can run for hours, so
@@ -1895,7 +1906,6 @@ class GatewayRunner:
                 )
                 del self._running_agents[_quick_key]
                 self._running_agents_ts.pop(_quick_key, None)
-
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
@@ -2044,6 +2054,9 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "whoami":
+            return await self._handle_whoami_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -2306,7 +2319,7 @@ class GatewayRunner:
         )
 
         # Get or create session
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = self.session_store.get_or_create_session(session_source)
         session_key = session_entry.session_key
         
         # Emit session:start for new or auto-reset sessions
@@ -3778,6 +3791,25 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    async def _handle_whoami_command(self, event: MessageEvent) -> str:
+        """Handle /whoami command - show the sender and routing identity Hermes sees."""
+        source = event.source
+        lines = [
+            "👤 **Hermes Sees You As**",
+            "",
+            f"**Platform:** {source.platform.value if source.platform else 'unknown'}",
+            f"**User ID:** `{source.user_id or 'unknown'}`",
+            f"**User Name:** {source.user_name or 'unknown'}",
+            f"**Chat ID:** `{source.chat_id}`",
+            f"**Chat Type:** {source.chat_type}",
+        ]
+        if source.chat_name:
+            lines.append(f"**Chat Name:** {source.chat_name}")
+        if source.thread_id:
+            lines.append(f"**Thread ID:** `{source.thread_id}`")
+        if source.chat_topic:
+            lines.append(f"**Chat Topic:** {source.chat_topic}")
+        return "\n".join(lines)
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
         import yaml
