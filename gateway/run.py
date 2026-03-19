@@ -355,6 +355,11 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         self._bash_jobs: Dict[str, str] = {}
+        self._subagent_runtime: Dict[str, Dict[str, Any]] = {}
+        self._acp_session_bindings: Dict[str, str] = {}
+        self._acp_session_meta: Dict[str, Dict[str, Any]] = {}
+        self._acp_running_tasks: Dict[str, asyncio.Task] = {}
+        self._acp_session_manager = None
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -1442,6 +1447,391 @@ class GatewayRunner:
             ]
         )
 
+    @staticmethod
+    def _control_commands_during_run() -> set[str]:
+        return {"status", "stop", "approve", "bash", "subagents", "kill", "steer", "tell", "acp"}
+
+    def _get_subagent_runtime(self) -> dict[str, dict[str, Any]]:
+        runtime = getattr(self, "_subagent_runtime", None)
+        if not isinstance(runtime, dict):
+            runtime = {}
+            self._subagent_runtime = runtime
+        return runtime
+
+    def _get_subagent_session_state(self, session_key: str) -> dict[str, Any]:
+        runtime = self._get_subagent_runtime()
+        state = runtime.get(session_key)
+        if not isinstance(state, dict):
+            state = {"next_ordinal": 1, "entries": {}}
+            runtime[session_key] = state
+        state.setdefault("next_ordinal", 1)
+        state.setdefault("entries", {})
+        return state
+
+    @staticmethod
+    def _subagent_now() -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _truncate_line(text: str, *, limit: int = 120) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
+
+    def _append_subagent_log(self, entry: dict[str, Any], message: str) -> None:
+        logs = entry.setdefault("logs", [])
+        logs.append(f"[{self._subagent_now()}] {message}")
+        if len(logs) > 60:
+            del logs[:-60]
+        entry["updated_at"] = self._subagent_now()
+
+    def _create_subagent_entry(
+        self,
+        *,
+        session_key: str,
+        child: Any,
+        task_index: int,
+        goal: str,
+        context: Optional[str],
+        toolsets: Optional[list[str]],
+        model: Optional[str],
+        source_kind: str,
+    ) -> dict[str, Any]:
+        state = self._get_subagent_session_state(session_key)
+        ordinal = int(state.get("next_ordinal", 1))
+        state["next_ordinal"] = ordinal + 1
+        subagent_id = f"sa-{ordinal}"
+        entry = {
+            "id": subagent_id,
+            "ordinal": ordinal,
+            "task_index": task_index,
+            "goal": str(goal or "").strip(),
+            "context": str(context or "").strip(),
+            "toolsets": list(toolsets or []),
+            "model": model or "",
+            "status": "pending",
+            "source_kind": source_kind,
+            "created_at": self._subagent_now(),
+            "updated_at": self._subagent_now(),
+            "started_at": None,
+            "ended_at": None,
+            "summary": "",
+            "error": "",
+            "logs": [],
+            "restarts": 0,
+            "child": child,
+            "pending_steer": None,
+        }
+        state["entries"][subagent_id] = entry
+        self._append_subagent_log(entry, f"Registered subagent for goal: {self._truncate_line(goal)}")
+        return entry
+
+    def _find_subagent_entry(self, session_key: str, child: Any) -> Optional[dict[str, Any]]:
+        if child is None:
+            return None
+        state = self._get_subagent_session_state(session_key)
+        for entry in state["entries"].values():
+            if entry.get("child") is child:
+                return entry
+        child_id = str(getattr(child, "_gateway_subagent_id", "") or "").strip()
+        if child_id:
+            return state["entries"].get(child_id)
+        return None
+
+    def _resolve_subagent_targets(
+        self,
+        session_key: str,
+        raw_target: str,
+        *,
+        active_only: bool = False,
+        allow_all: bool = False,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        state = self._get_subagent_session_state(session_key)
+        entries = list(state["entries"].values())
+        if active_only:
+            entries = [e for e in entries if e.get("status") in {"pending", "running"}]
+        target = str(raw_target or "").strip()
+        if not target:
+            if len(entries) == 1:
+                return [entries[0]], None
+            if not entries:
+                return [], "No matching subagents found for this session."
+            return [], "Multiple subagents match. Use an explicit `sa-#` or `#<n>` target."
+        if allow_all and target.lower() == "all":
+            return entries, None
+        if target.startswith("#"):
+            target = target[1:].strip()
+        if target.isdigit():
+            ordinal = int(target)
+            for entry in entries:
+                if int(entry.get("ordinal", 0)) == ordinal:
+                    return [entry], None
+            return [], f"No subagent found for `#{ordinal}`."
+        match = state["entries"].get(target)
+        if match and (not active_only or match.get("status") in {"pending", "running"}):
+            return [match], None
+        return [], f"No subagent found for `{target}`."
+
+    def _format_subagent_list(self, session_key: str) -> str:
+        state = self._get_subagent_session_state(session_key)
+        entries = list(state["entries"].values())
+        if not entries:
+            return "No subagents recorded for this session."
+        lines = ["🤖 **Subagents**", ""]
+        for entry in sorted(entries, key=lambda item: int(item.get("ordinal", 0))):
+            status = str(entry.get("status") or "unknown")
+            goal = self._truncate_line(entry.get("goal") or "(no goal)")
+            lines.append(f"- `#{entry['ordinal']}` / `{entry['id']}` — {status} — {goal}")
+            summary = str(entry.get("summary") or "").strip()
+            if summary:
+                lines.append(f"  summary: {self._truncate_line(summary, limit=140)}")
+        return "\n".join(lines)
+
+    def _format_subagent_info(self, entry: dict[str, Any]) -> str:
+        lines = [
+            "🤖 **Subagent Info**",
+            "",
+            f"**ID:** `{entry['id']}`",
+            f"**Ordinal:** `#{entry['ordinal']}`",
+            f"**Status:** `{entry.get('status')}`",
+            f"**Source:** `{entry.get('source_kind')}`",
+            f"**Model:** `{entry.get('model') or 'default'}`",
+            f"**Toolsets:** `{', '.join(entry.get('toolsets') or []) or 'default'}`",
+            f"**Goal:** {entry.get('goal') or '_(empty)_'}",
+        ]
+        if entry.get("error"):
+            lines.append(f"**Error:** `{entry['error']}`")
+        if entry.get("summary"):
+            lines.append(f"**Summary:** {entry['summary']}")
+        if entry.get("started_at"):
+            lines.append(f"**Started:** `{entry['started_at']}`")
+        if entry.get("ended_at"):
+            lines.append(f"**Ended:** `{entry['ended_at']}`")
+        return "\n".join(lines)
+
+    def _format_subagent_log(self, entry: dict[str, Any]) -> str:
+        lines = ["🤖 **Subagent Log**", "", f"**ID:** `{entry['id']}`", ""]
+        logs = entry.get("logs") or []
+        if not logs:
+            lines.append("_(no log events yet)_")
+        else:
+            lines.append("```")
+            lines.extend(logs[-25:])
+            lines.append("```")
+        return "\n".join(lines)
+
+    def _attach_subagent_runtime_hooks(self, agent: Any, session_key: str) -> None:
+        if agent is None:
+            return
+        agent._register_delegate_child = (
+            lambda **payload: self._register_delegate_child(session_key=session_key, **payload)
+        )
+        agent._start_delegate_child = (
+            lambda **payload: self._start_delegate_child(session_key=session_key, **payload)
+        )
+        agent._record_delegate_child_progress = (
+            lambda **payload: self._record_delegate_child_progress(session_key=session_key, **payload)
+        )
+        agent._complete_delegate_child = (
+            lambda **payload: self._complete_delegate_child(session_key=session_key, **payload)
+        )
+
+    def _register_delegate_child(
+        self,
+        *,
+        session_key: str,
+        child: Any,
+        task_index: int,
+        goal: str,
+        context: Optional[str],
+        toolsets: Optional[list[str]],
+        model: Optional[str],
+    ) -> str:
+        entry = self._create_subagent_entry(
+            session_key=session_key,
+            child=child,
+            task_index=task_index,
+            goal=goal,
+            context=context,
+            toolsets=toolsets,
+            model=model,
+            source_kind="delegate",
+        )
+        return entry["id"]
+
+    def _start_delegate_child(
+        self,
+        *,
+        session_key: str,
+        child: Any,
+        goal: str,
+        restarted: bool = False,
+    ) -> None:
+        entry = self._find_subagent_entry(session_key, child)
+        if not entry:
+            return
+        entry["status"] = "running"
+        entry["started_at"] = self._subagent_now()
+        entry["updated_at"] = self._subagent_now()
+        entry["goal"] = str(goal or "").strip()
+        if restarted:
+            entry["restarts"] = int(entry.get("restarts") or 0) + 1
+            self._append_subagent_log(entry, f"Restarted on steer: {self._truncate_line(goal)}")
+        else:
+            self._append_subagent_log(entry, f"Started: {self._truncate_line(goal)}")
+
+    def _record_delegate_child_progress(
+        self,
+        *,
+        session_key: str,
+        child: Any,
+        task_index: int,
+        tool_name: str,
+        preview: Optional[str],
+        args: Optional[dict[str, Any]],
+        summary: Optional[str],
+    ) -> None:
+        entry = self._find_subagent_entry(session_key, child)
+        if not entry:
+            return
+        text = summary or preview or tool_name
+        entry["last_progress"] = str(text or "").strip()
+        self._append_subagent_log(entry, f"{tool_name}: {self._truncate_line(text, limit=160)}")
+
+    def _complete_delegate_child(
+        self,
+        *,
+        session_key: str,
+        child: Any,
+        entry: dict[str, Any],
+        goal: str,
+    ) -> None:
+        stored = self._find_subagent_entry(session_key, child)
+        if not stored:
+            return
+        stored["status"] = entry.get("status", "completed")
+        stored["summary"] = str(entry.get("summary") or "").strip()
+        stored["error"] = str(entry.get("error") or "").strip()
+        stored["goal"] = str(goal or stored.get("goal") or "").strip()
+        stored["ended_at"] = self._subagent_now()
+        stored["updated_at"] = self._subagent_now()
+        stored["child"] = None
+        if stored["status"] == "completed":
+            self._append_subagent_log(stored, f"Completed: {self._truncate_line(stored.get('summary') or 'done', limit=160)}")
+        elif stored["status"] == "interrupted":
+            self._append_subagent_log(stored, "Interrupted.")
+        else:
+            detail = stored.get("error") or stored.get("summary") or "failed"
+            self._append_subagent_log(stored, f"Finished with {stored['status']}: {self._truncate_line(detail, limit=160)}")
+
+    def _build_subagent_progress_callback(self, session_key: str, child: Any):
+        def _callback(tool_name: str, preview: str = None, args: dict = None):
+            self._record_delegate_child_progress(
+                session_key=session_key,
+                child=child,
+                task_index=int(getattr(child, "_gateway_subagent_task_index", 0) or 0),
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                summary=preview or tool_name,
+            )
+
+        return _callback
+
+    def _get_acp_session_manager(self):
+        manager = getattr(self, "_acp_session_manager", None)
+        if manager is None:
+            from acp_adapter.session import SessionManager
+
+            manager = SessionManager()
+            self._acp_session_manager = manager
+        return manager
+
+    def _get_acp_bindings(self) -> dict[str, str]:
+        bindings = getattr(self, "_acp_session_bindings", None)
+        if not isinstance(bindings, dict):
+            bindings = {}
+            self._acp_session_bindings = bindings
+        return bindings
+
+    def _get_acp_meta(self) -> dict[str, dict[str, Any]]:
+        meta = getattr(self, "_acp_session_meta", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            self._acp_session_meta = meta
+        return meta
+
+    def _get_acp_tasks(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_acp_running_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._acp_running_tasks = tasks
+        return tasks
+
+    def _get_acp_session_meta_entry(self, session_id: str) -> dict[str, Any]:
+        meta = self._get_acp_meta()
+        entry = meta.get(session_id)
+        if not isinstance(entry, dict):
+            entry = {"options": {}, "last_result": None, "last_prompt": "", "updated_at": self._subagent_now()}
+            meta[session_id] = entry
+        entry.setdefault("options", {})
+        entry.setdefault("updated_at", self._subagent_now())
+        return entry
+
+    def _resolve_acp_target(self, session_key: str, payload: str) -> tuple[Optional[str], str]:
+        manager = self._get_acp_session_manager()
+        text = str(payload or "").strip()
+        parts = self._split_command_args(text, max_parts=2)
+        if parts and manager.get_session(parts[0]):
+            return parts[0], parts[1] if len(parts) > 1 else ""
+        bound = self._get_acp_bindings().get(session_key)
+        return bound, text
+
+    def _format_acp_sessions(self, session_key: str) -> str:
+        manager = self._get_acp_session_manager()
+        listing = manager.list_sessions()
+        if not listing:
+            return "No ACP sessions are active."
+        bound = self._get_acp_bindings().get(session_key)
+        tasks = self._get_acp_tasks()
+        lines = ["🧩 **ACP Sessions**", ""]
+        for item in listing:
+            session_id = item.get("session_id", "")
+            busy = session_id in tasks and not tasks[session_id].done()
+            label = " (bound)" if session_id == bound else ""
+            lines.append(
+                f"- `{session_id}`{label} — cwd `{item.get('cwd')}` — model `{item.get('model') or 'default'}` — busy `{str(busy).lower()}`"
+            )
+        return "\n".join(lines)
+
+    def _format_acp_status(self, session_id: str) -> str:
+        manager = self._get_acp_session_manager()
+        state = manager.get_session(session_id)
+        if state is None:
+            return f"No ACP session found for `{session_id}`."
+        meta = self._get_acp_session_meta_entry(session_id)
+        task = self._get_acp_tasks().get(session_id)
+        busy = bool(task and not task.done())
+        lines = [
+            "🧩 **ACP Status**",
+            "",
+            f"**Session:** `{session_id}`",
+            f"**Busy:** `{str(busy).lower()}`",
+            f"**CWD:** `{state.cwd}`",
+            f"**Model:** `{state.model or getattr(state.agent, 'model', '') or 'default'}`",
+            f"**History Messages:** `{len(state.history)}`",
+        ]
+        options = meta.get("options") or {}
+        if options:
+            lines.append(f"**Options:** `{json.dumps(options, default=str, sort_keys=True)}`")
+        if meta.get("last_prompt"):
+            lines.append(f"**Last Prompt:** {self._truncate_line(meta['last_prompt'], limit=180)}")
+        last_result = meta.get("last_result") or {}
+        if isinstance(last_result, dict) and last_result.get("final_response"):
+            lines.append(f"**Last Result:** {self._truncate_line(last_result['final_response'], limit=180)}")
+        return "\n".join(lines)
+
     def _prepare_skill_command(
         self,
         event: MessageEvent,
@@ -2018,6 +2408,26 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
+        for runtime in self._get_subagent_runtime().values():
+            for entry in runtime.get("entries", {}).values():
+                child = entry.get("child")
+                if child is not None and hasattr(child, "interrupt"):
+                    try:
+                        child.interrupt("Gateway shutting down")
+                    except Exception as e:
+                        logger.debug("Failed interrupting subagent during shutdown: %s", e)
+
+        for session_id, task in list(self._get_acp_tasks().items()):
+            state = self._get_acp_session_manager().get_session(session_id)
+            if state and state.cancel_event:
+                state.cancel_event.set()
+                try:
+                    state.agent.interrupt("Gateway shutting down")
+                except Exception:
+                    logger.debug("Failed interrupting ACP session during shutdown", exc_info=True)
+            if task and not task.done():
+                task.cancel()
+
         for platform, adapter in list(self.adapters.items()):
             try:
                 await adapter.cancel_background_tasks()
@@ -2296,42 +2706,40 @@ class GatewayRunner:
         # let the adapter-level batching/queueing logic absorb them.
         _quick_key = self._session_key_for_source(session_source)
         if _quick_key in self._running_agents:
-            if event.get_command() == "status":
+            command_name = (event.get_command() or "").strip().lower()
+            if command_name == "status":
                 return await self._handle_status_command(event)
-
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
             # text (which would be fed back to the agent with the same
-            # broken history — #2170).  Interrupt the agent first, then
+            # broken history — #2170). Interrupt the agent first, then
             # clear the adapter's pending queue so the stale "/reset" text
             # doesn't get re-processed as a user message after the
             # interrupt completes.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
+
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
             if _cmd_def_inner and _cmd_def_inner.name == "new":
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Session reset requested")
-                # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
-                if adapter and hasattr(adapter, 'get_pending_message'):
-                    adapter.get_pending_message(_quick_key)  # consume and discard
+                if adapter and hasattr(adapter, "get_pending_message"):
+                    adapter.get_pending_message(_quick_key)
                 self._pending_messages.pop(_quick_key, None)
-                # Clean up the running agent entry so the reset handler
-                # doesn't think an agent is still active.
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
                 return await self._handle_reset_command(event)
 
-            # /queue <prompt> — queue without interrupting
-            if event.get_command() in ("queue", "q"):
+            if _cmd_def_inner and _cmd_def_inner.name == "queue":
                 queued_text = event.get_command_args().strip()
                 if not queued_text:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
+
                     queued_event = _ME(
                         text=queued_text,
                         message_type=_MT.TEXT,
@@ -2341,7 +2749,9 @@ class GatewayRunner:
                     adapter._pending_messages[_quick_key] = queued_event
                 return "Queued for the next turn."
 
-            if event.message_type == MessageType.PHOTO:
+            if command_name in self._control_commands_during_run():
+                pass
+            elif event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
                 adapter = self.adapters.get(source.platform)
                 if adapter:
@@ -2361,26 +2771,22 @@ class GatewayRunner:
                     else:
                         adapter._pending_messages[_quick_key] = event
                 return None
-
-            running_agent = self._running_agents.get(_quick_key)
-            if running_agent is _AGENT_PENDING_SENTINEL:
-                # Agent is being set up but not ready yet.
-                if event.get_command() == "stop":
-                    # Nothing to interrupt — agent hasn't started yet.
-                    return "⏳ The agent is still starting up — nothing to stop yet."
-                # Queue the message so it will be picked up after the
-                # agent starts.
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    adapter._pending_messages[_quick_key] = event
-                return None
-            logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
             else:
-                self._pending_messages[_quick_key] = event.text
-            return None
+                running_agent = self._running_agents.get(_quick_key)
+                if running_agent is _AGENT_PENDING_SENTINEL:
+                    if command_name == "stop":
+                        return "⏳ The agent is still starting up — nothing to stop yet."
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        adapter._pending_messages[_quick_key] = event
+                    return None
+                logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
+                running_agent.interrupt(event.text)
+                if _quick_key in self._pending_messages:
+                    self._pending_messages[_quick_key] += "\n" + event.text
+                else:
+                    self._pending_messages[_quick_key] = event.text
+                return None
 
         rewritten_bash = self._rewrite_bash_shortcut(event.text)
         if rewritten_bash:
@@ -2567,32 +2973,16 @@ class GatewayRunner:
             return await self._handle_voice_command(event)
 
         if canonical == "subagents":
-            return self._parity_blocker_text(
-                "subagents",
-                "0028",
-                "Hermes still lacks a gateway-native sub-agent runtime registry and control plane.",
-            )
+            return await self._handle_subagents_command(event)
 
         if canonical == "kill":
-            return self._parity_blocker_text(
-                "kill",
-                "0028",
-                "Sub-agent kill control depends on the same missing gateway-native sub-agent runtime.",
-            )
+            return await self._handle_kill_command(event)
 
         if canonical == "steer":
-            return self._parity_blocker_text(
-                command,
-                "0028",
-                "Sub-agent steering is blocked until Hermes exposes a gateway-native sub-agent control plane.",
-            )
+            return await self._handle_steer_command(event)
 
         if canonical == "acp":
-            return self._parity_blocker_text(
-                "acp",
-                "0028",
-                "ACP session management is not wired into the gateway command runtime yet.",
-            )
+            return await self._handle_acp_command(event)
 
         if canonical == "bash":
             return await self._handle_bash_command(event)
@@ -3844,6 +4234,518 @@ class GatewayRunner:
         return (
             f"⚠️ Unknown debug action: `{action}`\n\n"
             "Use `/debug show [key]`, `/debug set <key> <value>`, `/debug unset <key>`, or `/debug reset`."
+        )
+
+    def _build_manual_subagent_agent(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        entry: dict[str, Any],
+    ):
+        from run_agent import AIAgent
+        from tools.delegate_tool import DEFAULT_TOOLSETS
+
+        model = _resolve_gateway_model()
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        self._apply_runtime_debug_overrides()
+        turn_route = self._resolve_turn_agent_config(entry.get("goal", ""), model, runtime_kwargs)
+        platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+        agent = AIAgent(
+            model=turn_route["model"],
+            **turn_route["runtime"],
+            max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+            quiet_mode=True,
+            verbose_logging=False,
+            enabled_toolsets=DEFAULT_TOOLSETS,
+            reasoning_config=self._get_effective_reasoning_config(),
+            skip_context_files=True,
+            skip_memory=True,
+            session_id=f"{session_key}:{entry['id']}",
+            platform=platform_key,
+        )
+        agent._gateway_subagent_id = entry["id"]
+        agent._gateway_subagent_task_index = entry["ordinal"]
+        agent.tool_progress_callback = self._build_subagent_progress_callback(session_key, agent)
+        self._attach_subagent_runtime_hooks(agent, session_key)
+        entry["child"] = agent
+        entry["toolsets"] = list(DEFAULT_TOOLSETS)
+        entry["model"] = turn_route["model"]
+        return agent
+
+    async def _notify_manual_subagent_completion(
+        self,
+        *,
+        source: SessionSource,
+        entry: dict[str, Any],
+    ) -> None:
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        status = str(entry.get("status") or "")
+        if status == "completed":
+            content = (
+                f"🤖 **Subagent Complete**\n\n"
+                f"**ID:** `{entry['id']}`\n"
+                f"**Goal:** {self._truncate_line(entry.get('goal') or '', limit=160)}\n\n"
+                f"{entry.get('summary') or '_(no summary)_'}"
+            )
+        else:
+            detail = entry.get("error") or entry.get("summary") or "Subagent stopped."
+            content = (
+                f"🤖 **Subagent {status.title() or 'Update'}**\n\n"
+                f"**ID:** `{entry['id']}`\n"
+                f"{self._truncate_line(detail, limit=500)}"
+            )
+        try:
+            await adapter.send(source.chat_id, content, metadata=metadata)
+        except Exception as e:
+            logger.debug("Manual subagent completion send failed: %s", e)
+
+    async def _start_manual_subagent(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        goal: str,
+    ) -> dict[str, Any]:
+        entry = self._create_subagent_entry(
+            session_key=session_key,
+            child=None,
+            task_index=0,
+            goal=goal,
+            context=None,
+            toolsets=[],
+            model=None,
+            source_kind="manual",
+        )
+        try:
+            agent = self._build_manual_subagent_agent(source=source, session_key=session_key, entry=entry)
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            self._append_subagent_log(entry, f"Failed to start: {exc}")
+            return entry
+
+        self._start_delegate_child(session_key=session_key, child=agent, goal=goal)
+        loop = asyncio.get_running_loop()
+
+        async def _runner():
+            current_goal = goal
+
+            def _run_sync():
+                nonlocal current_goal
+                while True:
+                    result = agent.run_conversation(
+                        user_message=current_goal,
+                        task_id=f"{session_key}:{entry['id']}",
+                    )
+                    pending_steer = str(entry.get("pending_steer") or "").strip()
+                    if result.get("interrupted") and pending_steer:
+                        entry["pending_steer"] = None
+                        current_goal = pending_steer
+                        self._start_delegate_child(
+                            session_key=session_key,
+                            child=agent,
+                            goal=current_goal,
+                            restarted=True,
+                        )
+                        continue
+                    return result, current_goal
+
+            result, final_goal = await loop.run_in_executor(None, _run_sync)
+            summary = str(result.get("final_response") or "").strip()
+            completed = bool(result.get("completed")) and bool(summary)
+            status = "interrupted" if result.get("interrupted") else "completed" if completed else "failed"
+            self._complete_delegate_child(
+                session_key=session_key,
+                child=agent,
+                entry={
+                    "status": status,
+                    "summary": summary,
+                    "error": result.get("error") or "",
+                },
+                goal=final_goal,
+            )
+            await self._notify_manual_subagent_completion(source=source, entry=entry)
+
+        entry["async_task"] = asyncio.create_task(_runner())
+        return entry
+
+    async def _handle_subagents_command(self, event: MessageEvent) -> str:
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        session_key = session_entry.session_key
+
+        raw_args = event.get_command_args().strip()
+        parts = self._split_command_args(raw_args, max_parts=2)
+        action = (parts[0].strip().lower() if parts else "list") or "list"
+        payload = parts[1] if len(parts) > 1 else ""
+
+        if action == "list":
+            return self._format_subagent_list(session_key)
+
+        if action == "info":
+            targets, error = self._resolve_subagent_targets(session_key, payload, active_only=False)
+            if error:
+                return error
+            return self._format_subagent_info(targets[0])
+
+        if action == "log":
+            targets, error = self._resolve_subagent_targets(session_key, payload, active_only=False)
+            if error:
+                return error
+            return self._format_subagent_log(targets[0])
+
+        if action == "spawn":
+            goal = str(payload or "").strip()
+            if not goal:
+                return "Usage: `/subagents spawn <goal>`"
+            entry = await self._start_manual_subagent(source=target_source, session_key=session_key, goal=goal)
+            if entry.get("status") == "error":
+                return f"❌ Failed to spawn subagent: {entry.get('error')}"
+            return (
+                f"🤖 Spawned subagent `#{entry['ordinal']}` / `{entry['id']}`.\n\n"
+                f"**Goal:** {goal}\n"
+                "Use `/subagents list`, `/subagents info <id>`, or `/subagents log <id>` to inspect it."
+            )
+
+        if action == "kill":
+            target = payload.strip()
+            return await self._handle_kill_command(
+                MessageEvent(
+                    text=f"/kill {target}".strip(),
+                    message_type=event.message_type,
+                    source=event.source,
+                    raw_message=event.raw_message,
+                    message_id=event.message_id,
+                    media_urls=event.media_urls,
+                    media_types=event.media_types,
+                    reply_to_message_id=event.reply_to_message_id,
+                    reply_to_text=event.reply_to_text,
+                    timestamp=event.timestamp,
+                    metadata=dict(event.metadata or {}),
+                )
+            )
+
+        if action in {"steer", "send"}:
+            if not payload.strip():
+                return f"Usage: `/subagents {action} <id|#> <message>`"
+            steer_parts = self._split_command_args(payload, max_parts=2)
+            if len(steer_parts) < 2:
+                return f"Usage: `/subagents {action} <id|#> <message>`"
+            target, message = steer_parts
+            steer_text = f"/steer {target} {message}"
+            return await self._handle_steer_command(
+                MessageEvent(
+                    text=steer_text,
+                    message_type=event.message_type,
+                    source=event.source,
+                    raw_message=event.raw_message,
+                    message_id=event.message_id,
+                    media_urls=event.media_urls,
+                    media_types=event.media_types,
+                    reply_to_message_id=event.reply_to_message_id,
+                    reply_to_text=event.reply_to_text,
+                    timestamp=event.timestamp,
+                    metadata=dict(event.metadata or {}),
+                )
+            )
+
+        return (
+            "Usage: `/subagents list|info|log|spawn|kill|steer|send`\n"
+            "Examples:\n"
+            "`/subagents list`\n"
+            "`/subagents spawn research the failing tests`\n"
+            "`/subagents steer #1 focus on the Discord adapter only`"
+        )
+
+    async def _handle_kill_command(self, event: MessageEvent) -> str:
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        session_key = session_entry.session_key
+        raw_target = event.get_command_args().strip()
+        targets, error = self._resolve_subagent_targets(
+            session_key,
+            raw_target,
+            active_only=True,
+            allow_all=True,
+        )
+        if error:
+            return error
+        if not targets:
+            return "No active subagents found for this session."
+        for entry in targets:
+            entry["pending_steer"] = None
+            child = entry.get("child")
+            if child is not None and hasattr(child, "interrupt"):
+                try:
+                    child.interrupt("Killed from /kill")
+                except Exception as e:
+                    logger.debug("Subagent kill failed for %s: %s", entry.get("id"), e)
+            self._append_subagent_log(entry, "Kill requested.")
+        if raw_target.strip().lower() == "all":
+            return f"🛑 Requested stop for `{len(targets)}` active subagent(s)."
+        return f"🛑 Requested stop for `{targets[0]['id']}`."
+
+    async def _handle_steer_command(self, event: MessageEvent) -> str:
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        session_key = session_entry.session_key
+        parts = self._split_command_args(event.get_command_args().strip(), max_parts=2)
+        if len(parts) < 2:
+            return "Usage: `/steer <id|#> <message>`"
+        target, message = parts
+        targets, error = self._resolve_subagent_targets(session_key, target, active_only=True)
+        if error:
+            return error
+        entry = targets[0]
+        child = entry.get("child")
+        if child is None or not hasattr(child, "interrupt"):
+            return f"Subagent `{entry['id']}` is not running."
+        entry["pending_steer"] = message
+        self._append_subagent_log(entry, f"Steer requested: {self._truncate_line(message, limit=160)}")
+        child.interrupt(message)
+        return (
+            f"↪ Steering subagent `{entry['id']}`.\n\n"
+            f"**Next goal:** {message}\n"
+            "The current run will stop and restart on the steer message."
+        )
+
+    async def _run_acp_prompt(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        prompt: str,
+    ) -> str:
+        manager = self._get_acp_session_manager()
+        state = manager.get_session(session_id)
+        if state is None:
+            return f"No ACP session found for `{session_id}`."
+        tasks = self._get_acp_tasks()
+        meta = self._get_acp_session_meta_entry(session_id)
+        if session_id in tasks and not tasks[session_id].done():
+            meta["pending_steer"] = prompt
+            meta["updated_at"] = self._subagent_now()
+            try:
+                state.cancel_event.set()
+                state.agent.interrupt(prompt)
+            except Exception:
+                logger.debug("ACP steer interrupt failed", exc_info=True)
+            return f"↪ Steering ACP session `{session_id}`."
+
+        loop = asyncio.get_running_loop()
+        meta["last_prompt"] = prompt
+        meta["status"] = "running"
+        meta["updated_at"] = self._subagent_now()
+
+        async def _runner():
+            current_prompt = prompt
+            while True:
+                if state.cancel_event:
+                    state.cancel_event.clear()
+
+                def _sync_run():
+                    return state.agent.run_conversation(
+                        user_message=current_prompt,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                    )
+
+                result = await loop.run_in_executor(None, _sync_run)
+                state.history = result.get("messages") or state.history
+                pending_steer = str(meta.pop("pending_steer", "") or "").strip()
+                if result.get("interrupted") and pending_steer:
+                    current_prompt = pending_steer
+                    meta["last_prompt"] = current_prompt
+                    meta["updated_at"] = self._subagent_now()
+                    continue
+                meta["last_result"] = result
+                meta["status"] = "interrupted" if result.get("interrupted") else "completed" if result.get("completed") else "failed"
+                meta["updated_at"] = self._subagent_now()
+                adapter = self.adapters.get(source.platform)
+                if adapter and result.get("final_response"):
+                    metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                    try:
+                        await adapter.send(
+                            source.chat_id,
+                            f"🧩 **ACP Session `{session_id}`**\n\n{result.get('final_response')}",
+                            metadata=metadata,
+                        )
+                    except Exception as e:
+                        logger.debug("ACP completion send failed: %s", e)
+                break
+
+        tasks[session_id] = asyncio.create_task(_runner())
+        return f"🧩 ACP session `{session_id}` is running."
+
+    async def _handle_acp_command(self, event: MessageEvent) -> str:
+        target_source = self._command_target_source_for_event(event)
+        session_entry = self.session_store.get_or_create_session(target_source)
+        session_key = session_entry.session_key
+        args = event.get_command_args().strip()
+        parts = self._split_command_args(args, max_parts=2)
+        action = (parts[0].strip().lower() if parts else "sessions") or "sessions"
+        payload = parts[1] if len(parts) > 1 else ""
+        manager = self._get_acp_session_manager()
+        bindings = self._get_acp_bindings()
+
+        if action == "sessions":
+            return self._format_acp_sessions(session_key)
+
+        if action == "spawn":
+            cwd = str(payload or ".").strip() or "."
+            state = manager.create_session(cwd=cwd)
+            bindings[session_key] = state.session_id
+            meta = self._get_acp_session_meta_entry(state.session_id)
+            meta["source"] = target_source
+            meta["updated_at"] = self._subagent_now()
+            return (
+                f"🧩 Created ACP session `{state.session_id}`.\n\n"
+                f"**CWD:** `{cwd}`\n"
+                "This session is now the default ACP target for this chat."
+            )
+
+        if action == "doctor":
+            try:
+                import acp as _acp  # noqa: F401
+                available = "yes"
+            except Exception:
+                available = "no"
+            bound = bindings.get(session_key) or "none"
+            running = sum(1 for task in self._get_acp_tasks().values() if not task.done())
+            return (
+                "🧩 **ACP Doctor**\n\n"
+                f"**Python ACP package:** `{available}`\n"
+                f"**Sessions:** `{len(manager.list_sessions())}`\n"
+                f"**Running:** `{running}`\n"
+                f"**Bound session for this chat:** `{bound}`"
+            )
+
+        if action == "install":
+            try:
+                import acp as _acp  # noqa: F401
+                return "ACP support is already installed in this Hermes environment."
+            except Exception as exc:
+                return f"ACP tooling is not importable in this environment: {exc}"
+
+        if action == "status":
+            target_id, remainder = self._resolve_acp_target(session_key, payload)
+            if target_id:
+                return self._format_acp_status(target_id)
+            return self._format_acp_sessions(session_key)
+
+        target_id, remainder = self._resolve_acp_target(session_key, payload)
+        if not target_id:
+            return "No ACP session is bound for this chat. Use `/acp spawn [cwd]` first or pass an explicit session ID."
+        state = manager.get_session(target_id)
+        if state is None:
+            return f"No ACP session found for `{target_id}`."
+        meta = self._get_acp_session_meta_entry(target_id)
+
+        if action == "close":
+            task = self._get_acp_tasks().get(target_id)
+            if task and not task.done():
+                return f"ACP session `{target_id}` is still running. Use `/acp cancel {target_id}` first."
+            removed = manager.remove_session(target_id)
+            if removed:
+                for key, value in list(bindings.items()):
+                    if value == target_id:
+                        bindings.pop(key, None)
+                self._get_acp_meta().pop(target_id, None)
+                return f"🧩 Closed ACP session `{target_id}`."
+            return f"No ACP session found for `{target_id}`."
+
+        if action == "cancel":
+            task = self._get_acp_tasks().get(target_id)
+            if state.cancel_event:
+                state.cancel_event.set()
+            try:
+                state.agent.interrupt()
+            except Exception:
+                logger.debug("ACP cancel interrupt failed", exc_info=True)
+            if task and not task.done():
+                return f"🛑 Cancel requested for ACP session `{target_id}`."
+            return f"ACP session `{target_id}` was idle; cancel flag set."
+
+        if action == "cwd":
+            new_cwd = str(remainder or "").strip()
+            if not new_cwd:
+                return f"🧩 ACP session `{target_id}` cwd: `{state.cwd}`"
+            manager.update_cwd(target_id, new_cwd)
+            return f"🧩 ACP session `{target_id}` cwd set to `{new_cwd}`."
+
+        if action == "model":
+            new_model = str(remainder or "").strip()
+            if not new_model:
+                return f"🧩 ACP session `{target_id}` model: `{state.model or getattr(state.agent, 'model', '') or 'default'}`"
+            state.model = new_model
+            try:
+                state.agent.model = new_model
+            except Exception:
+                logger.debug("Failed to update ACP agent model", exc_info=True)
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` model set to `{new_model}`."
+
+        if action == "set-mode":
+            mode = str(remainder or "").strip()
+            if not mode:
+                return "Usage: `/acp set-mode [session_id] <mode>`"
+            meta["options"]["mode"] = mode
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` mode set to `{mode}`."
+
+        if action == "permissions":
+            perms = str(remainder or "").strip()
+            if not perms:
+                current = meta["options"].get("permissions", "default")
+                return f"🧩 ACP session `{target_id}` permissions: `{current}`"
+            meta["options"]["permissions"] = perms
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` permissions set to `{perms}`."
+
+        if action == "timeout":
+            raw_timeout = str(remainder or "").strip()
+            if not raw_timeout:
+                current = meta["options"].get("timeout", "default")
+                return f"🧩 ACP session `{target_id}` timeout: `{current}`"
+            try:
+                timeout_value = int(raw_timeout)
+            except ValueError:
+                return f"Invalid timeout `{raw_timeout}`. Expected an integer number of seconds."
+            meta["options"]["timeout"] = timeout_value
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` timeout set to `{timeout_value}`s."
+
+        if action == "set":
+            kv = self._split_command_args(remainder, max_parts=2)
+            if len(kv) < 2:
+                return "Usage: `/acp set [session_id] <key> <value>`"
+            key, value = kv
+            meta["options"][key] = value
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` option `{key}` set to `{value}`."
+
+        if action == "reset-options":
+            cleared = len(meta["options"])
+            meta["options"] = {}
+            meta["updated_at"] = self._subagent_now()
+            return f"🧩 ACP session `{target_id}` reset `{cleared}` option(s)."
+
+        if action == "steer":
+            prompt = str(remainder or "").strip()
+            if not prompt:
+                return "Usage: `/acp steer [session_id] <message>`"
+            return await self._run_acp_prompt(source=target_source, session_id=target_id, prompt=prompt)
+
+        return (
+            "Usage: `/acp sessions|spawn|status|cancel|close|steer|cwd|model|set-mode|set|permissions|timeout|reset-options|doctor|install`\n"
+            "Examples:\n"
+            "`/acp spawn /home/alan/projects/hermes-agent`\n"
+            "`/acp steer write a quick status report`\n"
+            "`/acp status`"
         )
 
     async def _handle_bash_command(self, event: MessageEvent) -> str:
@@ -6997,6 +7899,7 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            self._attach_subagent_runtime_hooks(agent, session_key)
             
             # Store agent reference for interrupt support
             agent_holder[0] = agent
