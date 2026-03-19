@@ -194,12 +194,11 @@ def test_prepare_skill_command_lists_and_rewrites(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_subagents_command_returns_explicit_blocker():
+async def test_subagents_command_lists_empty_runtime():
     runner = _make_runner()
     result = await runner._handle_message(_make_event("/subagents list"))
 
-    assert "still blocked in Hermes parity work" in result
-    assert "`0028`" in result
+    assert "No subagents recorded" in result
 
 
 @pytest.mark.asyncio
