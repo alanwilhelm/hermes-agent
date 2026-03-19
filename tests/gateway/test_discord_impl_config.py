@@ -1,5 +1,6 @@
 """Tests for Discord config and policy helpers."""
 
+from gateway.config import PlatformConfig
 from gateway.platforms.discord_impl import config as discord_config
 
 
@@ -14,6 +15,12 @@ def test_parse_allowed_users_cleans_and_filters_entries():
     parsed = discord_config.parse_allowed_users(" 123, <@!456>, user:teknium, , <@789> ")
 
     assert parsed == {"123", "456", "teknium", "789"}
+
+
+def test_parse_free_response_channels_accepts_lists_and_strings():
+    parsed = discord_config.parse_free_response_channels(["123", " 456 ", 789, ""])
+
+    assert parsed == {"123", "456", "789"}
 
 
 def test_get_bot_filter_policy_defaults_to_none(monkeypatch):
@@ -59,3 +66,46 @@ def test_is_auto_thread_enabled_accepts_truthy_and_falsey_values(monkeypatch):
 
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     assert discord_config.is_auto_thread_enabled() is False
+
+
+def test_load_policy_config_reads_env_defaults(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "123,<@!456>")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "1,2")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    policy = discord_config.load_policy_config()
+
+    assert policy.allowed_users == {"123", "456"}
+    assert policy.bot_filter_policy == "mentions"
+    assert policy.free_response_channels == {"1", "2"}
+    assert policy.require_mention is False
+    assert policy.auto_thread is False
+
+
+def test_load_policy_config_prefers_platform_extra_over_env(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "111")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "10")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "allowed_users": ["<@!222>", "user:teknium"],
+            "allow_bots": "all",
+            "free_response_channels": ["20", "30"],
+            "require_mention": False,
+            "auto_thread": False,
+        },
+    )
+
+    policy = discord_config.load_policy_config(config)
+
+    assert policy.allowed_users == {"222", "teknium"}
+    assert policy.bot_filter_policy == "all"
+    assert policy.free_response_channels == {"20", "30"}
+    assert policy.require_mention is False
+    assert policy.auto_thread is False
