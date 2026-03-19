@@ -1739,15 +1739,53 @@ class DiscordAdapter(BasePlatformAdapter):
         is deleted so the channel isn't cluttered.
         """
         await interaction.response.defer(ephemeral=True)
+        response = await self._invoke_native_slash_command(interaction, command_text)
+        if response:
+            await self._send_native_slash_content(interaction, response)
+            return
+        if followup_msg:
+            try:
+                await interaction.followup.send(followup_msg, ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
+    async def _invoke_native_slash_command(
+        self,
+        interaction: discord.Interaction,
+        command_text: str,
+    ) -> str | None:
+        """Run a native slash command directly through the gateway handler."""
+        if not self._message_handler:
+            return None
         event = self._build_slash_event(interaction, command_text)
-        await self.handle_message(event)
-        try:
-            if followup_msg:
-                await interaction.edit_original_response(content=followup_msg)
-            else:
-                await interaction.delete_original_response()
-        except Exception as e:
-            logger.debug("Discord interaction cleanup failed: %s", e)
+        return await self._message_handler(event)
+
+    async def _send_native_slash_content(
+        self,
+        interaction: discord.Interaction,
+        content: str,
+    ) -> None:
+        """Send a native slash response back through the Discord interaction."""
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        response = getattr(interaction, "response", None)
+        followup = getattr(interaction, "followup", None)
+
+        first_chunk_sent = False
+        if response is not None and hasattr(response, "send_message"):
+            is_done = getattr(response, "is_done", None)
+            if not callable(is_done) or not is_done():
+                await response.send_message(chunks[0], ephemeral=True)
+                first_chunk_sent = True
+
+        start_index = 1 if first_chunk_sent else 0
+        if followup is not None and hasattr(followup, "send"):
+            for chunk in chunks[start_index:]:
+                await followup.send(chunk, ephemeral=True)
+            return
+
+        if not first_chunk_sent and response is not None and hasattr(response, "send_message"):
+            await response.send_message(chunks[0], ephemeral=True)
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""

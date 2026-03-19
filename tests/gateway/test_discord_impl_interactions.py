@@ -223,6 +223,8 @@ def _build_adapter():
     return SimpleNamespace(
         build_source=lambda **kwargs: SessionSource(platform=Platform.DISCORD, **kwargs),
         _run_simple_slash=AsyncMock(),
+        _invoke_native_slash_command=AsyncMock(),
+        _send_native_slash_content=AsyncMock(),
         _build_slash_event=MagicMock(return_value=SimpleNamespace()),
         handle_message=AsyncMock(),
         _handle_thread_create_slash=AsyncMock(),
@@ -356,6 +358,30 @@ async def test_native_dispatch_opens_fallback_menu_for_missing_discrete_arg():
     assert "Choose `effort` for `/think`." == args[0]
     assert kwargs["view"] is not None
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_route_sends_returned_response():
+    adapter = _build_adapter()
+    adapter._invoke_native_slash_command.return_value = "focused"
+    spec = next(spec for spec in interactions.native_commands.get_command_specs() if spec.name == "focus")
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+            is_done=lambda: True,
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await interactions.native_commands._dispatch(adapter, interaction, spec, name="release-room")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._invoke_native_slash_command.assert_awaited_once_with(
+        interaction,
+        "/focus release-room",
+    )
+    adapter._send_native_slash_content.assert_awaited_once_with(interaction, "focused")
 
 
 @pytest.mark.asyncio
