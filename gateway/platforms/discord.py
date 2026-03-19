@@ -426,6 +426,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._discord_policy: Optional[discord_config.DiscordPolicyConfig] = None
+        self._discord_policy_overrides: Dict[str, Any] = {}
         self._component_runtime = discord_interactions.create_component_runtime()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._resolve_exec_approval: Optional[Callable[..., Any]] = None
@@ -458,8 +459,22 @@ class DiscordAdapter(BasePlatformAdapter):
     def _get_discord_policy(self) -> discord_config.DiscordPolicyConfig:
         """Return the adapter's cached Discord policy snapshot."""
         if self._discord_policy is None:
-            self._discord_policy = discord_config.load_policy_config(self.config)
+            self._discord_policy = discord_config.load_policy_config(
+                self.config,
+                overrides=self._discord_policy_overrides,
+            )
         return self._discord_policy
+
+    def apply_runtime_policy_overrides(
+        self,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> discord_config.DiscordPolicyConfig:
+        """Apply runtime-only policy overrides for the active Discord connection."""
+        self._discord_policy_overrides = dict(overrides or {})
+        self._discord_policy = None
+        policy = self._get_discord_policy()
+        self._allowed_user_ids = set(policy.allowed_users)
+        return policy
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
