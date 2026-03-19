@@ -109,3 +109,30 @@ def test_load_policy_config_prefers_platform_extra_over_env(monkeypatch):
     assert policy.free_response_channels == {"20", "30"}
     assert policy.require_mention is False
     assert policy.auto_thread is False
+
+
+def test_load_policy_config_applies_runtime_overrides_over_platform_extra(monkeypatch):
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "allow_bots": "none",
+            "free_response_channels": ["20"],
+            "require_mention": True,
+            "auto_thread": True,
+        },
+    )
+
+    policy = discord_config.load_policy_config(
+        config,
+        overrides={
+            "allow_bots": "mentions",
+            "free_response_channels": ["44", "55"],
+            "require_mention": False,
+            "auto_thread": False,
+        },
+    )
+
+    assert policy.bot_filter_policy == "mentions"
+    assert policy.free_response_channels == {"44", "55"}
+    assert policy.require_mention is False
+    assert policy.auto_thread is False
