@@ -113,6 +113,18 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _notify_parent(parent_agent, hook_name: str, **payload):
+    """Best-effort callback into parent-owned delegation hooks."""
+    hook = getattr(parent_agent, hook_name, None)
+    if not callable(hook):
+        return None
+    try:
+        return hook(**payload)
+    except Exception as e:
+        logger.debug("Delegate parent hook %s failed: %s", hook_name, e)
+        return None
+
+
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -177,7 +189,28 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                     parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
                 except Exception as e:
                     logger.debug("Parent callback failed: %s", e)
+                _notify_parent(
+                    parent_agent,
+                    "_record_delegate_child_progress",
+                    child=getattr(_callback, "_delegate_child", None),
+                    task_index=task_index,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    summary=summary,
+                )
                 _batch.clear()
+
+        _notify_parent(
+            parent_agent,
+            "_record_delegate_child_progress",
+            child=getattr(_callback, "_delegate_child", None),
+            task_index=task_index,
+            tool_name=tool_name,
+            preview=preview,
+            args=args,
+            summary=preview or tool_name,
+        )
 
     def _flush():
         """Flush remaining batched tool names to gateway on completion."""
@@ -219,6 +252,7 @@ def _build_child_agent(
     routing subagents to a different provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
     """
+    import model_tools
     from run_agent import AIAgent
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
@@ -315,6 +349,9 @@ def _build_child_agent(
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, '_print_fn', None)
+    child._delegate_saved_tool_names = list(model_tools._last_resolved_tool_names)
+    if child_progress_cb is not None:
+        child_progress_cb._delegate_child = child
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
 
@@ -323,6 +360,19 @@ def _build_child_agent(
     child_pool = _resolve_child_credential_pool(effective_provider, parent_agent)
     if child_pool is not None:
         child._credential_pool = child_pool
+
+    subagent_id = _notify_parent(
+        parent_agent,
+        "_register_delegate_child",
+        child=child,
+        task_index=task_index,
+        goal=goal,
+        context=context,
+        toolsets=child_toolsets,
+        model=effective_model,
+    )
+    if subagent_id:
+        child._gateway_subagent_id = subagent_id
 
     # Register child for interrupt propagation
     if hasattr(parent_agent, '_active_children'):
@@ -368,9 +418,40 @@ def _run_single_child(
                     child._swap_credential(leased_entry)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
+    current_goal = goal
+    _notify_parent(
+        parent_agent,
+        "_start_delegate_child",
+        child=child,
+        goal=current_goal,
+    )
 
     try:
-        result = child.run_conversation(user_message=goal)
+        while True:
+            result = child.run_conversation(user_message=current_goal)
+            pending_steer = getattr(child, "_gateway_pending_steer", None)
+            if result.get("interrupted") and pending_steer:
+                setattr(child, "_gateway_pending_steer", None)
+                current_goal = str(pending_steer).strip()
+                _notify_parent(
+                    parent_agent,
+                    "_record_delegate_child_progress",
+                    child=child,
+                    task_index=task_index,
+                    tool_name="subagent_steer",
+                    preview=current_goal,
+                    args=None,
+                    summary=f"restart on steer: {current_goal[:120]}",
+                )
+                _notify_parent(
+                    parent_agent,
+                    "_start_delegate_child",
+                    child=child,
+                    goal=current_goal,
+                    restarted=True,
+                )
+                continue
+            break
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):
@@ -464,12 +545,20 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
+        _notify_parent(
+            parent_agent,
+            "_complete_delegate_child",
+            child=child,
+            entry=entry,
+            goal=current_goal,
+        )
+
         return entry
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
-        return {
+        entry = {
             "task_index": task_index,
             "status": "error",
             "summary": None,
@@ -477,6 +566,14 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
         }
+        _notify_parent(
+            parent_agent,
+            "_complete_delegate_child",
+            child=child,
+            entry=entry,
+            goal=current_goal,
+        )
+        return entry
 
     finally:
         if child_pool is not None and leased_cred_id is not None:
