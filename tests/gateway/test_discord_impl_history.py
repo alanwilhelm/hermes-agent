@@ -6,7 +6,6 @@ import sys
 
 import pytest
 
-
 def _install_discord_mock():
     class FakeIntents:
         @staticmethod
@@ -222,11 +221,12 @@ async def test_fetch_history_returns_empty_without_read_access():
 
 
 @pytest.mark.asyncio
-async def test_fetch_history_raises_value_error_for_missing_channel():
+async def test_fetch_history_returns_empty_for_missing_channel():
     client = _make_client(None)
 
-    with pytest.raises(ValueError, match="Channel 123 not found"):
-        await history.fetch_history(client, "123")
+    result = await history.fetch_history(client, "123")
+
+    assert result == []
 
 
 def test_history_message_dataclass_fields():
@@ -265,7 +265,6 @@ async def test_search_history_filters_by_case_insensitive_query():
     result = await history.search_history(client, "123", "HeRmEs", limit=5)
 
     assert [message.id for message in result] == ["10", "8"]
-    assert channel.last_history_kwargs["limit"] == 10
 
 
 @pytest.mark.asyncio
@@ -298,3 +297,46 @@ async def test_search_history_returns_empty_when_no_matches():
     result = await history.search_history(client, "123", "needle")
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_search_history_returns_empty_for_missing_channel():
+    client = _make_client(None)
+
+    result = await history.search_history(client, "123", "needle")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_search_history_finds_match_beyond_old_limit_multiplier_window():
+    channel = FakeHistoryChannel(
+        [
+            _make_message(message_id, content="needle" if message_id == 130 else f"message {message_id}")
+            for message_id in range(250, 0, -1)
+        ]
+    )
+    client = _make_client(channel)
+
+    result = await history.search_history(client, "123", "needle", limit=1)
+
+    assert [message.id for message in result] == ["130"]
+
+
+@pytest.mark.asyncio
+async def test_search_history_finds_author_filtered_match_beyond_old_limit_multiplier_window():
+    messages = []
+    for message_id in range(250, 0, -1):
+        if 250 >= message_id >= 150:
+            messages.append(_make_message(message_id, content="deploy update", author_id="2"))
+        elif message_id == 130:
+            messages.append(_make_message(message_id, content="deploy update", author_id="1"))
+        else:
+            messages.append(_make_message(message_id, content=f"message {message_id}", author_id="2"))
+
+    channel = FakeHistoryChannel(messages)
+    client = _make_client(channel)
+
+    result = await history.search_history(client, "123", "deploy", limit=1, author_id="1")
+
+    assert [message.id for message in result] == ["130"]

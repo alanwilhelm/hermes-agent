@@ -176,6 +176,25 @@ async def test_create_thread_falls_back_to_seed_message():
 
 
 @pytest.mark.asyncio
+async def test_create_thread_rejects_dm_channel():
+    dm_channel = threads.discord.DMChannel()
+
+    async def resolve_channel_fn(_client, _interaction):
+        return dm_channel
+
+    result = await threads.create_thread(
+        client=MagicMock(),
+        interaction=SimpleNamespace(user=SimpleNamespace(display_name="Jezza")),
+        name="Planning",
+        message="",
+        auto_archive_duration=1440,
+        resolve_channel_fn=resolve_channel_fn,
+    )
+
+    assert result == {"error": "Discord threads can only be created inside server text channels, not DMs."}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("name", "message", "auto_archive_duration", "resolve_mode", "expected_error"),
     [

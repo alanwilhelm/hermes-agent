@@ -5,7 +5,6 @@ import sys
 
 import pytest
 
-
 def _install_discord_mock():
     class FakeIntents:
         @staticmethod
@@ -129,7 +128,7 @@ async def test_check_channel_permissions_for_guild_text_channel():
 
 
 @pytest.mark.asyncio
-async def test_check_channel_permissions_for_dm_channel_sets_all_true():
+async def test_check_channel_permissions_for_dm_channel_disables_thread_flags():
     dm_channel = permissions.discord.DMChannel()
     dm_channel.id = 321
     dm_channel.name = None
@@ -148,8 +147,8 @@ async def test_check_channel_permissions_for_dm_channel_sets_all_true():
         can_attach_files=True,
         can_embed_links=True,
         can_add_reactions=True,
-        can_manage_threads=True,
-        can_create_threads=True,
+        can_manage_threads=False,
+        can_create_threads=False,
     )
 
 

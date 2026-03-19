@@ -14,6 +14,9 @@ from typing import Any, Optional
 from gateway.platforms.discord_impl.delivery import resolve_channel
 from gateway.platforms.discord_impl import permissions as discord_permissions
 
+SEARCH_SCAN_LIMIT = 500
+SEARCH_PAGE_SIZE = 100
+
 
 @dataclass
 class HistoryMessage:
@@ -129,7 +132,7 @@ async def fetch_history(
     """Fetch bounded message history from a Discord channel."""
     channel = await resolve_channel(client, channel_id)
     if channel is None:
-        raise ValueError(f"Channel {channel_id} not found")
+        return []
 
     channel_permissions = discord_permissions._build_channel_permissions(client, channel)
     if not (channel_permissions.can_read and channel_permissions.can_read_history):
@@ -150,28 +153,41 @@ async def search_history(
     limit: int = 50,
     author_id: Optional[str] = None,
 ) -> list[HistoryMessage]:
-    """Search channel history with text matching."""
+    """Search recent channel history with bounded text matching."""
     normalized_query = (query or "").strip().lower()
     if not normalized_query:
         return []
 
     clamped_limit = _clamp_limit(limit)
-    messages = await fetch_history(
-        client,
-        channel_id,
-        limit=min(clamped_limit * 2, 500),
-    )
-
     filtered_messages: list[HistoryMessage] = []
     author_filter = str(author_id) if author_id is not None else None
+    remaining_scan = SEARCH_SCAN_LIMIT
+    before: Optional[str] = None
 
-    for message in messages:
-        if author_filter is not None and message.author_id != author_filter:
-            continue
-        if normalized_query not in message.content.lower():
-            continue
-        filtered_messages.append(message)
-        if len(filtered_messages) >= clamped_limit:
+    while remaining_scan > 0 and len(filtered_messages) < clamped_limit:
+        page_size = min(SEARCH_PAGE_SIZE, remaining_scan)
+        messages = await fetch_history(
+            client,
+            channel_id,
+            limit=page_size,
+            before=before,
+        )
+        if not messages:
             break
+
+        remaining_scan -= len(messages)
+
+        for message in messages:
+            if author_filter is not None and message.author_id != author_filter:
+                continue
+            if normalized_query not in message.content.lower():
+                continue
+            filtered_messages.append(message)
+            if len(filtered_messages) >= clamped_limit:
+                break
+
+        if len(messages) < page_size:
+            break
+        before = messages[-1].id
 
     return filtered_messages
