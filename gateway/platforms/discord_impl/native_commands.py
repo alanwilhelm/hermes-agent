@@ -1328,8 +1328,9 @@ async def _dispatch(adapter: Any, interaction: Any, spec: DiscordNativeCommandSp
         if spec.defer_ephemeral:
             await interaction.response.defer(ephemeral=True)
         command_text = spec.command_factory(**kwargs) if spec.command_factory else f"/{spec.name}"
-        event = adapter._build_slash_event(interaction, command_text)
-        await adapter.handle_message(event)
+        response = await adapter._invoke_native_slash_command(interaction, command_text)
+        if response:
+            await adapter._send_native_slash_content(interaction, response)
         return
 
     if spec.route == "thread":
