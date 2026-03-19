@@ -909,16 +909,18 @@ def _build_choices_decorator(
         autocomplete_factory = getattr(discord.app_commands, "autocomplete", None)
         if autocomplete_factory is None:
             return (lambda fn: fn), None
+
+        async def autocomplete_callback(interaction, current):
+            return await _autocomplete_choices(
+                adapter,
+                spec,
+                arg,
+                interaction,
+                current,
+            )
+
         return None, discord.app_commands.autocomplete(
-            **{
-                arg.name: lambda interaction, current, _adapter=adapter, _spec=spec, _arg=arg: _autocomplete_choices(
-                    _adapter,
-                    _spec,
-                    _arg,
-                    interaction,
-                    current,
-                )
-            }
+            **{arg.name: autocomplete_callback}
         )
 
     if choices:
@@ -937,8 +939,8 @@ def _build_choices_decorator(
 
 def _register_zero_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
     @tree.command(name=spec.name, description=spec.description)
-    async def callback(interaction: Any, _spec: DiscordNativeCommandSpec = spec):
-        await _dispatch(adapter, interaction, _spec)
+    async def callback(interaction: Any):
+        await _dispatch(adapter, interaction, spec)
 
 
 def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
@@ -956,10 +958,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            name=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            name: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, name=name)
+            await _dispatch(adapter, interaction, spec, name=name)
         return
 
     if arg.name == "effort":
@@ -969,10 +970,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            effort=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            effort: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, effort=effort)
+            await _dispatch(adapter, interaction, spec, effort=effort)
         return
 
     if arg.name == "days":
@@ -983,9 +983,8 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         async def callback(
             interaction: Any,
             days: int = arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
         ):
-            await _dispatch(adapter, interaction, _spec, days=days)
+            await _dispatch(adapter, interaction, spec, days=days)
         return
 
     if arg.name == "mode":
@@ -995,10 +994,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            mode=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            mode: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, mode=mode)
+            await _dispatch(adapter, interaction, spec, mode=mode)
         return
 
     if arg.name == "path":
@@ -1008,10 +1006,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            path=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            path: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, path=path)
+            await _dispatch(adapter, interaction, spec, path=path)
         return
 
     if arg.name == "instructions":
@@ -1021,10 +1018,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            instructions=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            instructions: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, instructions=instructions)
+            await _dispatch(adapter, interaction, spec, instructions=instructions)
         return
 
     if arg.name == "target":
@@ -1034,10 +1030,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            target=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            target: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, target=target)
+            await _dispatch(adapter, interaction, spec, target=target)
         return
 
     if arg.name == "command":
@@ -1047,10 +1042,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            command=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            command: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, command=command)
+            await _dispatch(adapter, interaction, spec, command=command)
         return
 
     if arg.name == "decision":
@@ -1060,10 +1054,9 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            decision=arg.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            decision: str = arg.default,
         ):
-            await _dispatch(adapter, interaction, _spec, decision=decision)
+            await _dispatch(adapter, interaction, spec, decision=decision)
         return
 
     raise ValueError(f"Unsupported Discord arg registration for {spec.name}:{arg.name}")
@@ -1087,14 +1080,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            decision=first.default,
-            approval_id=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            decision: str = first.default,
+            approval_id: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 decision=decision,
                 approval_id=approval_id,
             )
@@ -1110,14 +1102,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            mode=first.default,
-            value=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            mode: str = first.default,
+            value: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 mode=mode,
                 value=value,
             )
@@ -1133,14 +1124,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            mode=first.default,
-            entry=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            mode: str = first.default,
+            entry: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 mode=mode,
                 entry=entry,
             )
@@ -1156,14 +1146,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            name=first.default,
-            input=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            name: str = first.default,
+            input: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 name=name,
                 input=input,
             )
@@ -1179,14 +1168,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            mode=first.default,
-            payload=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            mode: str = first.default,
+            payload: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 mode=mode,
                 payload=payload,
             )
@@ -1202,14 +1190,13 @@ def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            target=first.default,
-            message=second.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            target: str = first.default,
+            message: str = second.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 target=target,
                 message=message,
             )
@@ -1239,15 +1226,14 @@ def _register_triple_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
         @choices_decorator
         async def callback(
             interaction: Any,
-            mode=first.default,
-            key=second.default,
-            value=third.default,
-            _spec: DiscordNativeCommandSpec = spec,
+            mode: str = first.default,
+            key: str = second.default,
+            value: str = third.default,
         ):
             await _dispatch(
                 adapter,
                 interaction,
-                _spec,
+                spec,
                 mode=mode,
                 key=key,
                 value=value,
@@ -1271,12 +1257,11 @@ def _register_thread_command(tree: Any, adapter: Any, spec: DiscordNativeCommand
         name: str,
         message: str = "",
         auto_archive_duration: int = 1440,
-        _spec: DiscordNativeCommandSpec = spec,
     ):
         await _dispatch(
             adapter,
             interaction,
-            _spec,
+            spec,
             name=name,
             message=message,
             auto_archive_duration=auto_archive_duration,
