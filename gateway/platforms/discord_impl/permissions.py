@@ -32,6 +32,27 @@ class ChannelPermissions:
     can_create_threads: bool
 
 
+@dataclass
+class AccessibleChannel:
+    """Readable Discord channel entry with normalized target metadata."""
+
+    channel_id: str
+    channel_name: str
+    guild_id: Optional[str]
+    guild_name: Optional[str]
+    channel_kind: str
+    qualified_name: str
+    mention: str
+    can_read: bool
+    can_send: bool
+    can_read_history: bool
+    can_attach_files: bool
+    can_embed_links: bool
+    can_add_reactions: bool
+    can_manage_threads: bool
+    can_create_threads: bool
+
+
 def _channel_name(channel: Any) -> str:
     recipient = getattr(channel, "recipient", None)
     recipient_name = getattr(recipient, "name", None)
@@ -115,6 +136,32 @@ def _build_channel_permissions(client: Any, channel: Any) -> ChannelPermissions:
     )
 
 
+def _build_accessible_channel(client: Any, channel: Any) -> AccessibleChannel:
+    perms = _build_channel_permissions(client, channel)
+    guild = getattr(channel, "guild", None)
+    guild_id = str(getattr(guild, "id", "")) if getattr(guild, "id", None) is not None else None
+    guild_name = getattr(guild, "name", None)
+    channel_name = _channel_name(channel)
+    qualified_name = f"{guild_name}/{channel_name}" if guild_name else channel_name
+    return AccessibleChannel(
+        channel_id=perms.channel_id,
+        channel_name=channel_name,
+        guild_id=guild_id,
+        guild_name=guild_name,
+        channel_kind="channel",
+        qualified_name=qualified_name,
+        mention=f"<#{perms.channel_id}>",
+        can_read=perms.can_read,
+        can_send=perms.can_send,
+        can_read_history=perms.can_read_history,
+        can_attach_files=perms.can_attach_files,
+        can_embed_links=perms.can_embed_links,
+        can_add_reactions=perms.can_add_reactions,
+        can_manage_threads=perms.can_manage_threads,
+        can_create_threads=perms.can_create_threads,
+    )
+
+
 async def check_channel_permissions(
     client: Any,
     channel_id: str,
@@ -129,20 +176,20 @@ async def check_channel_permissions(
 async def list_accessible_channels(
     client: Any,
     guild_id: Optional[str] = None,
-) -> list[ChannelPermissions]:
+) -> list[AccessibleChannel]:
     """List channels the bot can access, optionally filtered by guild."""
     if not client:
         return []
 
-    accessible_channels: list[ChannelPermissions] = []
+    accessible_channels: list[AccessibleChannel] = []
     for guild in getattr(client, "guilds", []) or []:
         if guild_id is not None and str(getattr(guild, "id", "")) != str(guild_id):
             continue
 
         for channel in getattr(guild, "text_channels", []) or []:
-            channel_permissions = _build_channel_permissions(client, channel)
-            if channel_permissions.can_read:
-                accessible_channels.append(channel_permissions)
+            accessible_channel = _build_accessible_channel(client, channel)
+            if accessible_channel.can_read:
+                accessible_channels.append(accessible_channel)
 
     return accessible_channels
 

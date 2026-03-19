@@ -113,6 +113,9 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
                 "name": ch.name,
                 "guild": guild.name,
                 "type": "channel",
+                "qualified_name": f"{guild.name}/{ch.name}",
+                "mention": f"<#{ch.id}>",
+                "target": f"channel:{ch.id}",
             })
         # Also include DM-capable users we've interacted with is not
         # feasible via guild enumeration; those come from sessions.
@@ -200,7 +203,18 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     if not channels:
         return None
 
-    query = _normalize_channel_query(name)
+    raw_query = name.strip()
+    if platform_name == "discord":
+        if raw_query.startswith("<#") and raw_query.endswith(">"):
+            mention_id = raw_query[2:-1].strip()
+            if mention_id.isdigit():
+                return mention_id
+        if raw_query.lower().startswith("channel:"):
+            channel_id = raw_query.split(":", 1)[1].strip()
+            if channel_id.isdigit():
+                return channel_id
+
+    query = _normalize_channel_query(raw_query)
 
     # 1. Exact name match, including the display labels shown by send_message(action="list")
     for ch in channels:
