@@ -161,6 +161,37 @@ async def test_add_and_remove_reaction_delegate_to_message_methods():
     message.remove_reaction.assert_awaited_once_with("🔥", adapter._client.user)
 
 
+def test_apply_runtime_policy_overrides_refreshes_cached_policy():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "allow_bots": "none",
+                "free_response_channels": ["10"],
+                "require_mention": True,
+                "auto_thread": True,
+            },
+        )
+    )
+
+    original = adapter._get_discord_policy()
+    updated = adapter.apply_runtime_policy_overrides(
+        {
+            "allow_bots": "mentions",
+            "free_response_channels": ["77", "88"],
+            "require_mention": False,
+            "auto_thread": False,
+        }
+    )
+
+    assert original.bot_filter_policy == "none"
+    assert updated.bot_filter_policy == "mentions"
+    assert updated.free_response_channels == {"77", "88"}
+    assert updated.require_mention is False
+    assert updated.auto_thread is False
+
+
 class _FakeHistoryIterator:
     def __init__(self, messages):
         self._messages = list(messages)
