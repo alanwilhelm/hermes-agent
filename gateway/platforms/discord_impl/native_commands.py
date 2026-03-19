@@ -1,10 +1,11 @@
-"""Structured Discord native command registration."""
+"""Structured Discord native command registration and command UX helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
+from gateway.platforms.discord_impl import components as discord_components
 from gateway.platforms.discord_impl import command_sessions
 
 try:
@@ -20,6 +21,7 @@ except ImportError:  # pragma: no cover - import guard
 class DiscordChoiceSpec:
     name: str
     value: str
+    description: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -28,7 +30,10 @@ class DiscordArgSpec:
     description: str
     kind: str = "str"  # "str" or "int"
     default: Any = ""
+    required: bool = False
     choices: tuple[DiscordChoiceSpec, ...] = ()
+    prefer_autocomplete: bool = False
+    allow_fallback_menu: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,36 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
         DiscordChoiceSpec("tts — voice reply to all messages", "tts"),
         DiscordChoiceSpec("off — text only", "off"),
         DiscordChoiceSpec("status — show current mode", "status"),
+    )
+    vc_choices = (
+        DiscordChoiceSpec("join — join your current voice channel", "join"),
+        DiscordChoiceSpec("leave — leave the active voice channel", "leave"),
+        DiscordChoiceSpec("status — show current voice channel status", "status"),
+    )
+    think_choices = (
+        DiscordChoiceSpec("off — disable reasoning effort", "off"),
+        DiscordChoiceSpec("minimal — minimum reasoning", "minimal"),
+        DiscordChoiceSpec("low — lighter reasoning", "low"),
+        DiscordChoiceSpec("medium — balanced reasoning", "medium"),
+        DiscordChoiceSpec("high — deeper reasoning", "high"),
+        DiscordChoiceSpec("xhigh — maximum reasoning", "xhigh"),
+    )
+    reasoning_choices = (
+        DiscordChoiceSpec("off — hide reasoning blocks", "off"),
+        DiscordChoiceSpec("on — show reasoning blocks", "on"),
+        DiscordChoiceSpec("hide — hide reasoning blocks", "hide"),
+        DiscordChoiceSpec("show — show reasoning blocks", "show"),
+        DiscordChoiceSpec("none — disable reasoning effort", "none"),
+        DiscordChoiceSpec("minimal — minimum reasoning", "minimal"),
+        DiscordChoiceSpec("low — lighter reasoning", "low"),
+        DiscordChoiceSpec("medium — balanced reasoning", "medium"),
+        DiscordChoiceSpec("high — deeper reasoning", "high"),
+        DiscordChoiceSpec("xhigh — maximum reasoning", "xhigh"),
+    )
+    approval_choices = (
+        DiscordChoiceSpec("allow-once — run this command once", "allow-once"),
+        DiscordChoiceSpec("allow-always — permanently allow this pattern", "allow-always"),
+        DiscordChoiceSpec("deny — reject this command", "deny"),
     )
 
     return (
@@ -126,6 +161,24 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
                 DiscordArgSpec(
                     "effort",
                     "Reasoning effort: xhigh, high, medium, low, minimal, or none.",
+                    choices=reasoning_choices,
+                    prefer_autocomplete=True,
+                    allow_fallback_menu=True,
+                ),
+            ),
+        ),
+        DiscordNativeCommandSpec(
+            "think",
+            "Set reasoning effort quickly",
+            "dispatch",
+            lambda effort="": _join_command("/think", effort),
+            args=(
+                DiscordArgSpec(
+                    "effort",
+                    "Thinking effort: off, minimal, low, medium, high, or xhigh.",
+                    choices=think_choices,
+                    prefer_autocomplete=True,
+                    allow_fallback_menu=True,
                 ),
             ),
         ),
@@ -234,6 +287,42 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
                     "mode",
                     "Voice mode: on, off, tts, channel, leave, or status",
                     choices=voice_choices,
+                    prefer_autocomplete=True,
+                    allow_fallback_menu=True,
+                ),
+            ),
+        ),
+        DiscordNativeCommandSpec(
+            "vc",
+            "Join, leave, or inspect Discord voice channel state",
+            "dispatch",
+            lambda mode="": _join_command("/vc", mode),
+            args=(
+                DiscordArgSpec(
+                    "mode",
+                    "Voice channel command: join, leave, or status",
+                    choices=vc_choices,
+                    prefer_autocomplete=True,
+                    allow_fallback_menu=True,
+                ),
+            ),
+        ),
+        DiscordNativeCommandSpec(
+            "approve",
+            "Resolve a pending command approval",
+            "dispatch",
+            lambda decision="", approval_id="": _join_command("/approve", approval_id, decision),
+            args=(
+                DiscordArgSpec(
+                    "decision",
+                    "Approval decision: allow-once, allow-always, or deny",
+                    choices=approval_choices,
+                    prefer_autocomplete=True,
+                    allow_fallback_menu=True,
+                ),
+                DiscordArgSpec(
+                    "approval_id",
+                    "Approval ID shown in the approval prompt footer. Optional for the current chat.",
                 ),
             ),
         ),
@@ -271,6 +360,158 @@ def extract_inline_shortcut(text: str) -> tuple[str | None, str]:
     return command_sessions.extract_inline_shortcut(text)
 
 
+def _resolve_arg_choices(
+    adapter: Any,
+    spec: DiscordNativeCommandSpec,
+    arg: DiscordArgSpec,
+    *,
+    interaction: Any | None = None,
+    current_kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[DiscordChoiceSpec, ...]:
+    del adapter, spec, interaction, current_kwargs
+    return arg.choices
+
+
+def _format_choice_label(label: str, *, limit: int = 80) -> str:
+    if len(label) <= limit:
+        return label
+    return label[: limit - 3] + "..."
+
+
+async def _send_or_edit_interaction_view(interaction: Any, content: str, view: Any) -> None:
+    response = getattr(interaction, "response", None)
+    if response is not None and hasattr(response, "edit_message") and getattr(interaction, "message", None) is not None:
+        try:
+            await response.edit_message(content=content, view=view)
+            return
+        except Exception:
+            pass
+    if response is not None and hasattr(response, "send_message"):
+        is_done = getattr(response, "is_done", None)
+        if not callable(is_done) or not is_done():
+            await response.send_message(content, ephemeral=True, view=view)
+            return
+    followup = getattr(interaction, "followup", None)
+    if followup is not None and hasattr(followup, "send"):
+        await followup.send(content, ephemeral=True, view=view)
+
+
+async def _open_arg_fallback(
+    adapter: Any,
+    interaction: Any,
+    spec: DiscordNativeCommandSpec,
+    arg: DiscordArgSpec,
+    current_kwargs: dict[str, Any],
+) -> bool:
+    choices = _resolve_arg_choices(adapter, spec, arg, interaction=interaction, current_kwargs=current_kwargs)
+    if not choices or not arg.allow_fallback_menu:
+        return False
+
+    runtime = getattr(adapter, "_component_runtime", None)
+    if runtime is None or getattr(discord_components, "ManagedComponentView", None) is None:
+        return False
+
+    view = discord_components.ManagedComponentView(runtime, timeout=300)
+    allowed_user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+    prompt = f"Choose `{arg.name}` for `/{spec.name}`."
+
+    async def _choose(invocation: discord_components.DiscordComponentInvocation, value: str) -> bool:
+        next_kwargs = dict(current_kwargs)
+        next_kwargs[arg.name] = value
+        await _dispatch(adapter, invocation.interaction, spec, **next_kwargs)
+        return True
+
+    if len(choices) <= 5:
+        for choice in choices:
+            view.add_button(
+                discord_components.DiscordButtonSpec(
+                    label=_format_choice_label(choice.name, limit=40),
+                    style="primary",
+                    allowed_user_ids=(allowed_user_id,),
+                    handler=lambda invocation, value=choice.value: _choose(invocation, value),
+                )
+            )
+    else:
+        view.add_select(
+            discord_components.DiscordSelectSpec(
+                select_type="string",
+                placeholder=arg.description,
+                options=tuple(
+                    discord_components.DiscordSelectOptionSpec(
+                        label=_format_choice_label(choice.name, limit=100),
+                        value=choice.value,
+                        description=choice.description,
+                    )
+                    for choice in choices[:25]
+                ),
+                allowed_user_ids=(allowed_user_id,),
+                handler=lambda invocation: _choose(invocation, invocation.values[0]),
+            )
+        )
+
+    await _send_or_edit_interaction_view(interaction, prompt, view)
+    return True
+
+
+async def _autocomplete_choices(
+    adapter: Any,
+    spec: DiscordNativeCommandSpec,
+    arg: DiscordArgSpec,
+    interaction: Any,
+    current: str,
+) -> list[Any]:
+    choices = _resolve_arg_choices(adapter, spec, arg, interaction=interaction)
+    query = str(current or "").strip().lower()
+    filtered = [
+        choice
+        for choice in choices
+        if not query
+        or query in choice.name.lower()
+        or query in choice.value.lower()
+    ]
+    return [
+        discord.app_commands.Choice(name=choice.name, value=choice.value)
+        for choice in filtered[:25]
+    ]
+
+
+def _build_choices_decorator(
+    adapter: Any,
+    spec: DiscordNativeCommandSpec,
+    arg: DiscordArgSpec,
+):
+    choices = _resolve_arg_choices(adapter, spec, arg)
+    use_autocomplete = bool(arg.prefer_autocomplete and choices)
+    if use_autocomplete:
+        autocomplete_factory = getattr(discord.app_commands, "autocomplete", None)
+        if autocomplete_factory is None:
+            return (lambda fn: fn), None
+        return None, discord.app_commands.autocomplete(
+            **{
+                arg.name: lambda interaction, current, _adapter=adapter, _spec=spec, _arg=arg: _autocomplete_choices(
+                    _adapter,
+                    _spec,
+                    _arg,
+                    interaction,
+                    current,
+                )
+            }
+        )
+
+    if choices:
+        return discord.app_commands.choices(
+            **{
+                arg.name: [
+                    discord.app_commands.Choice(name=choice.name, value=choice.value)
+                    for choice in choices[:25]
+                ]
+            }
+        ), None
+
+    identity = lambda fn: fn
+    return identity, None
+
+
 def _register_zero_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
     @tree.command(name=spec.name, description=spec.description)
     async def callback(interaction: Any, _spec: DiscordNativeCommandSpec = spec):
@@ -279,22 +520,16 @@ def _register_zero_arg_command(tree: Any, adapter: Any, spec: DiscordNativeComma
 
 def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
     arg = spec.args[0]
-
-    if arg.choices:
-        choices_decorator = discord.app_commands.choices(
-            **{
-                arg.name: [
-                    discord.app_commands.Choice(name=choice.name, value=choice.value)
-                    for choice in arg.choices
-                ]
-            }
-        )
-    else:
+    choices_decorator, autocomplete_decorator = _build_choices_decorator(adapter, spec, arg)
+    if choices_decorator is None:
         choices_decorator = lambda fn: fn
+    if autocomplete_decorator is None:
+        autocomplete_decorator = lambda fn: fn
 
     if arg.name == "name":
         @tree.command(name=spec.name, description=spec.description)
         @discord.app_commands.describe(name=arg.description)
+        @autocomplete_decorator
         @choices_decorator
         async def callback(
             interaction: Any,
@@ -307,6 +542,7 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
     if arg.name == "effort":
         @tree.command(name=spec.name, description=spec.description)
         @discord.app_commands.describe(effort=arg.description)
+        @autocomplete_decorator
         @choices_decorator
         async def callback(
             interaction: Any,
@@ -319,6 +555,7 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
     if arg.name == "days":
         @tree.command(name=spec.name, description=spec.description)
         @discord.app_commands.describe(days=arg.description)
+        @autocomplete_decorator
         @choices_decorator
         async def callback(
             interaction: Any,
@@ -331,6 +568,7 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
     if arg.name == "mode":
         @tree.command(name=spec.name, description=spec.description)
         @discord.app_commands.describe(mode=arg.description)
+        @autocomplete_decorator
         @choices_decorator
         async def callback(
             interaction: Any,
@@ -340,7 +578,55 @@ def _register_single_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCom
             await _dispatch(adapter, interaction, _spec, mode=mode)
         return
 
+    if arg.name == "decision":
+        @tree.command(name=spec.name, description=spec.description)
+        @discord.app_commands.describe(decision=arg.description)
+        @autocomplete_decorator
+        @choices_decorator
+        async def callback(
+            interaction: Any,
+            decision=arg.default,
+            _spec: DiscordNativeCommandSpec = spec,
+        ):
+            await _dispatch(adapter, interaction, _spec, decision=decision)
+        return
+
     raise ValueError(f"Unsupported Discord arg registration for {spec.name}:{arg.name}")
+
+
+def _register_double_arg_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
+    first, second = spec.args
+    if (first.name, second.name) != ("decision", "approval_id"):
+        raise ValueError(
+            f"Unsupported Discord command spec shape for {spec.name}:{first.name},{second.name}"
+        )
+
+    choices_decorator, autocomplete_decorator = _build_choices_decorator(adapter, spec, first)
+    if choices_decorator is None:
+        choices_decorator = lambda fn: fn
+    if autocomplete_decorator is None:
+        autocomplete_decorator = lambda fn: fn
+
+    @tree.command(name=spec.name, description=spec.description)
+    @discord.app_commands.describe(
+        decision=first.description,
+        approval_id=second.description,
+    )
+    @autocomplete_decorator
+    @choices_decorator
+    async def callback(
+        interaction: Any,
+        decision=first.default,
+        approval_id=second.default,
+        _spec: DiscordNativeCommandSpec = spec,
+    ):
+        await _dispatch(
+            adapter,
+            interaction,
+            _spec,
+            decision=decision,
+            approval_id=approval_id,
+        )
 
 
 def _register_thread_command(tree: Any, adapter: Any, spec: DiscordNativeCommandSpec) -> None:
@@ -382,6 +668,9 @@ def register_slash_commands(tree: Any, adapter: Any) -> None:
         if len(spec.args) == 1:
             _register_single_arg_command(tree, adapter, spec)
             continue
+        if len(spec.args) == 2:
+            _register_double_arg_command(tree, adapter, spec)
+            continue
         raise ValueError(f"Unsupported Discord command spec shape for {spec.name}")
 
 
@@ -391,6 +680,27 @@ def build_slash_event(adapter: Any, interaction: Any, text: str):
 
 
 async def _dispatch(adapter: Any, interaction: Any, spec: DiscordNativeCommandSpec, **kwargs: Any) -> None:
+    missing_choice_arg = next(
+        (
+            arg
+            for arg in spec.args
+            if arg.allow_fallback_menu
+            and not str(kwargs.get(arg.name, "") or "").strip()
+            and _resolve_arg_choices(adapter, spec, arg, interaction=interaction, current_kwargs=kwargs)
+        ),
+        None,
+    )
+    if missing_choice_arg is not None:
+        opened = await _open_arg_fallback(
+            adapter,
+            interaction,
+            spec,
+            missing_choice_arg,
+            kwargs,
+        )
+        if opened:
+            return
+
     if spec.route == "simple":
         command_text = spec.command_factory(**kwargs) if spec.command_factory else f"/{spec.name}"
         await adapter._run_simple_slash(interaction, command_text, spec.followup_msg)

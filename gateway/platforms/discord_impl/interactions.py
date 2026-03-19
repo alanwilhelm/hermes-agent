@@ -1,4 +1,4 @@
-"""Discord slash command wiring and approval UI helpers."""
+"""Discord slash command wiring and interaction helpers."""
 
 from __future__ import annotations
 
@@ -32,116 +32,77 @@ def create_component_runtime() -> discord_components.DiscordComponentRuntime:
 
 if DISCORD_AVAILABLE:
 
-    class ExecApprovalView(discord_components.ManagedComponentView):
-        """Interactive exec approval view built on the generic component runtime."""
+    def create_exec_approval_view(
+        adapter: Any,
+        approval_id: str,
+        allowed_user_ids: set,
+        runtime: discord_components.DiscordComponentRuntime | None = None,
+    ):
+        """Build a generic component-runtime approval view."""
+        runtime = runtime or create_component_runtime()
+        view = discord_components.ManagedComponentView(runtime, timeout=300)
+        allowed = tuple(str(user_id) for user_id in allowed_user_ids)
 
-        def __init__(
-            self,
-            approval_id: str,
-            allowed_user_ids: set,
-            runtime: discord_components.DiscordComponentRuntime | None = None,
-        ):
-            self._runtime = runtime or create_component_runtime()
-            super().__init__(self._runtime, timeout=300)
-            self.approval_id = approval_id
-            self.allowed_user_ids = allowed_user_ids
-            self.resolved = False
-            self.add_button(
-                discord_components.DiscordButtonSpec(
-                    label="Allow Once",
-                    style="success",
-                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
-                    handler=lambda invocation: self.allow_once(
-                        invocation.interaction,
-                        invocation.component,
-                    ),
-                )
-            )
-            self.add_button(
-                discord_components.DiscordButtonSpec(
-                    label="Always Allow",
-                    style="primary",
-                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
-                    handler=lambda invocation: self.allow_always(
-                        invocation.interaction,
-                        invocation.component,
-                    ),
-                )
-            )
-            self.add_button(
-                discord_components.DiscordButtonSpec(
-                    label="Deny",
-                    style="danger",
-                    allowed_user_ids=tuple(str(user_id) for user_id in allowed_user_ids),
-                    handler=lambda invocation: self.deny(
-                        invocation.interaction,
-                        invocation.component,
-                    ),
-                )
-            )
+        async def _resolve(invocation: discord_components.DiscordComponentInvocation, decision: str, color: Any) -> bool:
+            resolver = getattr(adapter, "_resolve_exec_approval", None)
+            if not callable(resolver):
+                await invocation.deny("Approval resolver is unavailable~")
+                return False
 
-        def _check_auth(self, interaction: discord.Interaction) -> bool:
-            """Verify the user clicking is authorized."""
-            if not self.allowed_user_ids:
-                return True
-            return str(interaction.user.id) in self.allowed_user_ids
+            result = resolver(decision=decision, approval_id=approval_id)
+            if hasattr(result, "__await__"):
+                result = await result
 
-        async def _resolve(
-            self, interaction: discord.Interaction, action: str, color: discord.Color
-        ):
-            """Resolve the approval and update the message."""
-            if self.resolved:
-                await interaction.response.send_message(
-                    "This approval has already been resolved~", ephemeral=True
-                )
-                return
-
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not authorized to approve commands~", ephemeral=True
-                )
-                return
-
-            self.resolved = True
-
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            embed = invocation.interaction.message.embeds[0] if invocation.interaction.message.embeds else None
             if embed:
                 embed.color = color
-                embed.set_footer(text=f"{action} by {interaction.user.display_name}")
+                embed.set_footer(text=f"{decision} by {invocation.interaction.user.display_name}")
 
-            for child in self.children:
-                child.disabled = True
+            invocation.disable_all()
+            await invocation.interaction.response.edit_message(embed=embed, view=view)
 
-            await interaction.response.edit_message(embed=embed, view=self)
+            followup = getattr(invocation.interaction, "followup", None)
+            if followup is not None and hasattr(followup, "send"):
+                await followup.send(str(result), ephemeral=True)
+            return True
 
-            try:
-                from tools.approval import approve_permanent
-
-                if action == "allow_always":
-                    approve_permanent(self.approval_id)
-            except ImportError:
-                pass
-
-        async def allow_once(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ):
-            await self._resolve(interaction, "allow_once", discord.Color.green())
-
-        async def allow_always(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ):
-            await self._resolve(interaction, "allow_always", discord.Color.blue())
-
-        async def deny(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ):
-            await self._resolve(interaction, "deny", discord.Color.red())
-
-        async def on_timeout(self):
-            """Handle view timeout -- disable buttons and mark as expired."""
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
+        view.add_button(
+            discord_components.DiscordButtonSpec(
+                label="Allow Once",
+                style="success",
+                allowed_user_ids=allowed,
+                handler=lambda invocation: _resolve(
+                    invocation,
+                    "allow-once",
+                    discord.Color.green(),
+                ),
+            )
+        )
+        view.add_button(
+            discord_components.DiscordButtonSpec(
+                label="Always Allow",
+                style="primary",
+                allowed_user_ids=allowed,
+                handler=lambda invocation: _resolve(
+                    invocation,
+                    "allow-always",
+                    discord.Color.blue(),
+                ),
+            )
+        )
+        view.add_button(
+            discord_components.DiscordButtonSpec(
+                label="Deny",
+                style="danger",
+                allowed_user_ids=allowed,
+                handler=lambda invocation: _resolve(
+                    invocation,
+                    "deny",
+                    discord.Color.red(),
+                ),
+            )
+        )
+        return view
 
 else:  # pragma: no cover - import guard
-    ExecApprovalView = None
+    create_exec_approval_view = None

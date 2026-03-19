@@ -426,6 +426,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_policy: Optional[discord_config.DiscordPolicyConfig] = None
         self._component_runtime = discord_interactions.create_component_runtime()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._resolve_exec_approval: Optional[Callable[..., Any]] = None
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -1952,9 +1953,13 @@ class DiscordAdapter(BasePlatformAdapter):
         return await discord_threads.auto_create_thread(message)
 
     async def send_exec_approval(
-        self, chat_id: str, command: str, session_key: str,
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -1984,12 +1989,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 color=discord.Color.orange(),
             )
             embed.add_field(name="Reason", value=description, inline=False)
-
-            view = ExecApprovalView(
-                session_key=session_key,
+            approval_id = str(approval_id or session_key or "").strip()
+            view = discord_interactions.create_exec_approval_view(
+                self,
+                approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
                 runtime=self._component_runtime,
             )
+            if approval_id:
+                embed.set_footer(text=f"Approval ID: {approval_id}")
+            else:
+                return SendResult(success=False, error="Missing approval ID")
 
             msg = await channel.send(embed=embed, view=view)
             if hasattr(view, "bind_message"):
