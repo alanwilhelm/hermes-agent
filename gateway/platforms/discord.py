@@ -424,6 +424,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._discord_policy: Optional[discord_config.DiscordPolicyConfig] = None
+        self._component_runtime = discord_interactions.create_component_runtime()
         self._allowed_user_ids: set = set()  # For button approval authorization
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -1882,9 +1883,12 @@ class DiscordAdapter(BasePlatformAdapter):
             view = discord_interactions.ExecApprovalView(
                 approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
+                runtime=self._component_runtime,
             )
 
             msg = await channel.send(embed=embed, view=view)
+            if hasattr(view, "bind_message"):
+                view.bind_message(str(msg.id))
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
