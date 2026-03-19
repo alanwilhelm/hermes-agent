@@ -422,6 +422,7 @@ class DiscordAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
+        self._discord_policy: Optional[discord_config.DiscordPolicyConfig] = None
         self._allowed_user_ids: set = set()  # For button approval authorization
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -447,6 +448,12 @@ class DiscordAdapter(BasePlatformAdapter):
         self._seen_messages: Dict[str, float] = {}
         self._SEEN_TTL = 300   # 5 minutes
         self._SEEN_MAX = 2000  # prune threshold
+
+    def _get_discord_policy(self) -> discord_config.DiscordPolicyConfig:
+        """Return the adapter's cached Discord policy snapshot."""
+        if self._discord_policy is None:
+            self._discord_policy = discord_config.load_policy_config(self.config)
+        return self._discord_policy
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -497,9 +504,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
 
             # Parse allowed user entries (may contain usernames or IDs)
-            self._allowed_user_ids = discord_config.parse_allowed_users(
-                os.getenv("DISCORD_ALLOWED_USERS", "")
-            )
+            self._allowed_user_ids = set(self._get_discord_policy().allowed_users)
 
             # Set up intents.
             # Message Content is required for normal text replies.
@@ -571,9 +576,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 #   "mentions" — accept bot messages only when they @mention us
                 #   "all"      — accept all bot messages
                 is_mentioned = bool(self._client.user and self._client.user in message.mentions)
+                policy = adapter_self._get_discord_policy()
                 if discord_intake.should_filter_bot_message(
                     is_bot=getattr(message.author, "bot", False),
-                    policy=discord_config.get_bot_filter_policy(),
+                    policy=policy.bot_filter_policy,
                     is_mentioned=is_mentioned,
                 ):
                     return
@@ -2134,17 +2140,18 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = None
         parent_channel_id = None
         is_thread = isinstance(message.channel, discord.Thread)
+        policy = self._get_discord_policy()
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         if not isinstance(message.channel, discord.DMChannel):
-            free_channels = discord_config.get_free_response_channels()
+            free_channels = policy.free_response_channels
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = discord_config.is_mention_required()
+            require_mention = policy.require_mention
             is_free_channel = bool(channel_ids & free_channels)
 
             # Skip the mention check if the message is in a thread where
@@ -2168,7 +2175,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
-            if discord_config.is_auto_thread_enabled():
+            if policy.auto_thread:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     is_thread = True

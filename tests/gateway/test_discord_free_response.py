@@ -140,6 +140,48 @@ async def test_discord_free_response_in_server_channels(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_platform_extra_overrides_env_for_mention_policy(monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"require_mention": False},
+    )
+    adapter = DiscordAdapter(config)
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    adapter.handle_message = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="hello from channel")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_platform_extra_overrides_env_for_free_response_channels(monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "999")
+
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"free_response_channels": ["123"]},
+    )
+    adapter = DiscordAdapter(config)
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    adapter.handle_message = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="allowed without mention")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_discord_free_response_in_threads(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
