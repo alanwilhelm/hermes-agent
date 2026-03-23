@@ -42,6 +42,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+import gateway.platforms.discord as discord_platform  # noqa: E402
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 
 
@@ -159,6 +160,29 @@ async def test_add_and_remove_reaction_delegate_to_message_methods():
     assert remove_result.success is True
     message.add_reaction.assert_awaited_once_with("🔥")
     message.remove_reaction.assert_awaited_once_with("🔥", adapter._client.user)
+
+
+@pytest.mark.asyncio
+async def test_send_typing_delegates_to_delivery_helper(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace()
+    helper = AsyncMock()
+    monkeypatch.setattr(discord_platform.discord_delivery, "start_typing", helper)
+
+    await adapter.send_typing("555")
+
+    helper.assert_awaited_once_with(adapter._client, "555", adapter._typing_tasks)
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_delegates_to_delivery_helper(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    helper = AsyncMock()
+    monkeypatch.setattr(discord_platform.discord_delivery, "stop_typing", helper)
+
+    await adapter.stop_typing("555")
+
+    helper.assert_awaited_once_with("555", adapter._typing_tasks)
 
 
 def test_apply_runtime_policy_overrides_refreshes_cached_policy():

@@ -1435,44 +1435,18 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
         Instead, start a background loop that hits the typing endpoint every
-        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
+        8 seconds (typing indicator lasts ~10s). The loop is cancelled when
         stop_typing() is called (after the response is sent).
         """
-        if not self._client:
-            return
-        # Don't start a duplicate loop
-        if chat_id in self._typing_tasks:
-            return
-
-        async def _typing_loop() -> None:
-            try:
-                while True:
-                    try:
-                        route = discord.http.Route(
-                            "POST", "/channels/{channel_id}/typing",
-                            channel_id=chat_id,
-                        )
-                        await self._client.http.request(route)
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as e:
-                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
-                        return
-                    await asyncio.sleep(8)
-            except asyncio.CancelledError:
-                pass
-
-        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
+        await discord_delivery.start_typing(
+            self._client,
+            chat_id,
+            self._typing_tasks,
+        )
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop the persistent typing indicator for a channel."""
-        task = self._typing_tasks.pop(chat_id, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await discord_delivery.stop_typing(chat_id, self._typing_tasks)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
