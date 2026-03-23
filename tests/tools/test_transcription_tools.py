@@ -423,7 +423,9 @@ class TestTranscribeLocalExtended:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
-             patch("tools.transcription_tools._local_model_name", None):
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_device", None), \
+             patch("tools.transcription_tools._local_model_compute_type", None):
             from tools.transcription_tools import _transcribe_local
             _transcribe_local(str(audio), "base")
             _transcribe_local(str(audio), "base")
@@ -449,7 +451,9 @@ class TestTranscribeLocalExtended:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
-             patch("tools.transcription_tools._local_model_name", None):
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_device", None), \
+             patch("tools.transcription_tools._local_model_compute_type", None):
             from tools.transcription_tools import _transcribe_local
             _transcribe_local(str(audio), "base")
             _transcribe_local(str(audio), "small")
@@ -464,12 +468,56 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
-             patch("tools.transcription_tools._local_model", None):
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_device", None), \
+             patch("tools.transcription_tools._local_model_compute_type", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio), "large-v3")
 
         assert result["success"] is False
         assert "CUDA out of memory" in result["error"]
+
+    def test_cuda_runtime_error_falls_back_to_cpu(self, tmp_path):
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        mock_segment = MagicMock()
+        mock_segment.text = "hi"
+        mock_info = MagicMock()
+        mock_info.language = "en"
+        mock_info.duration = 1.0
+
+        cpu_model = MagicMock()
+        cpu_model.transcribe.return_value = ([mock_segment], mock_info)
+        mock_whisper_cls = MagicMock(
+            side_effect=[
+                RuntimeError("Library libcublas.so.12 is not found or cannot be loaded"),
+                cpu_model,
+            ]
+        )
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_device", None), \
+             patch("tools.transcription_tools._local_model_compute_type", None):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hi"
+        assert result["provider"] == "local"
+        assert result["device"] == "cpu"
+        assert result["compute_type"] == "int8"
+
+        first_call = mock_whisper_cls.call_args_list[0]
+        second_call = mock_whisper_cls.call_args_list[1]
+        assert first_call.kwargs["device"] == "auto"
+        assert first_call.kwargs["compute_type"] == "auto"
+        assert second_call.kwargs["device"] == "cpu"
+        assert second_call.kwargs["compute_type"] == "int8"
 
     def test_multiple_segments_joined(self, tmp_path):
         audio = tmp_path / "test.ogg"
@@ -488,7 +536,10 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", return_value=mock_model), \
-             patch("tools.transcription_tools._local_model", None):
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_device", None), \
+             patch("tools.transcription_tools._local_model_compute_type", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio), "base")
 

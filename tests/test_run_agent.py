@@ -2052,6 +2052,24 @@ class TestSafeWriter:
         writer = _SafeWriter(inner)
         writer.flush()  # should not raise
 
+    def test_isatty_catches_valueerror_for_closed_stream(self):
+        """isatty() on a closed wrapped stream should degrade to False."""
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        inner = MagicMock()
+        inner.isatty.side_effect = ValueError("I/O operation on closed file")
+        writer = _SafeWriter(inner)
+        assert writer.isatty() is False
+
+    def test_fileno_catches_valueerror_for_closed_stream(self):
+        """fileno() on a closed wrapped stream should not raise."""
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        inner = MagicMock()
+        inner.fileno.side_effect = ValueError("I/O operation on closed file")
+        writer = _SafeWriter(inner)
+        assert writer.fileno() == -1
+
     def test_print_survives_broken_stdout(self, monkeypatch):
         """print() through _SafeWriter doesn't crash on broken pipe."""
         import sys

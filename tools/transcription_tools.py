@@ -69,6 +69,81 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_local_model_device: Optional[str] = None
+_local_model_compute_type: Optional[str] = None
+
+
+_CUDA_RUNTIME_ERROR_MARKERS = (
+    "libcublas.so",
+    "libcuda.so",
+    "cudnn",
+    "cuda driver",
+    "cuda runtime",
+    "failed to load shared library",
+)
+
+
+def _looks_like_cuda_runtime_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _CUDA_RUNTIME_ERROR_MARKERS)
+
+
+def _load_local_model(model_name: str, *, device: str, compute_type: str):
+    global _local_model, _local_model_name, _local_model_device, _local_model_compute_type
+
+    from faster_whisper import WhisperModel
+
+    needs_reload = (
+        _local_model is None
+        or _local_model_name != model_name
+        or _local_model_device != device
+        or _local_model_compute_type != compute_type
+    )
+    if needs_reload:
+        logger.info(
+            "Loading faster-whisper model '%s' on %s (%s)...",
+            model_name,
+            device,
+            compute_type,
+        )
+        _local_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        _local_model_name = model_name
+        _local_model_device = device
+        _local_model_compute_type = compute_type
+
+    return _local_model
+
+
+def _transcribe_with_local_model(file_path: str, model_name: str, *, device: str, compute_type: str) -> Dict[str, Any]:
+    model = _load_local_model(model_name, device=device, compute_type=compute_type)
+    segments, info = model.transcribe(file_path, beam_size=5)
+    transcript = " ".join(segment.text.strip() for segment in segments)
+
+    logger.info(
+        "Transcribed %s via local whisper (%s, device=%s, compute=%s, lang=%s, %.1fs audio)",
+        Path(file_path).name,
+        model_name,
+        device,
+        compute_type,
+        info.language,
+        info.duration,
+    )
+
+    return {
+        "success": True,
+        "transcript": transcript,
+        "provider": "local",
+        "device": device,
+        "compute_type": compute_type,
+    }
+
+
+def _reset_local_model_cache() -> None:
+    global _local_model, _local_model_name, _local_model_device, _local_model_compute_type
+    _local_model = None
+    _local_model_name = None
+    _local_model_device = None
+    _local_model_compute_type = None
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -270,30 +345,38 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
-    global _local_model, _local_model_name
-
     if not _HAS_FASTER_WHISPER:
         return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
-        from faster_whisper import WhisperModel
-        # Lazy-load the model (downloads on first use, ~150 MB for 'base')
-        if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = WhisperModel(model_name, device="auto", compute_type="auto")
-            _local_model_name = model_name
-
-        segments, info = _local_model.transcribe(file_path, beam_size=5)
-        transcript = " ".join(segment.text.strip() for segment in segments)
-
-        logger.info(
-            "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
-            Path(file_path).name, model_name, info.language, info.duration,
+        return _transcribe_with_local_model(
+            file_path,
+            model_name,
+            device="auto",
+            compute_type="auto",
         )
-
-        return {"success": True, "transcript": transcript, "provider": "local"}
-
     except Exception as e:
+        if _looks_like_cuda_runtime_error(e):
+            logger.warning(
+                "Local faster-whisper auto device failed with CUDA/runtime error; retrying on CPU: %s",
+                e,
+            )
+            try:
+                _reset_local_model_cache()
+                return _transcribe_with_local_model(
+                    file_path,
+                    model_name,
+                    device="cpu",
+                    compute_type="int8",
+                )
+            except Exception as cpu_error:
+                logger.error("Local transcription failed after CPU fallback: %s", cpu_error, exc_info=True)
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"Local transcription failed: {cpu_error}",
+                }
+
         logger.error("Local transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
 

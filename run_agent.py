@@ -108,7 +108,7 @@ HONCHO_TOOL_NAMES = {
 
 
 class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
+    """Transparent stdio wrapper that catches broken or closed stdio access.
 
     When hermes-agent runs as a systemd service, Docker container, or headless
     daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
@@ -122,8 +122,8 @@ class _SafeWriter:
     ``ValueError: I/O operation on closed file`` instead of OSError.
 
     This wrapper delegates all writes to the underlying stream and silently
-    catches both OSError and ValueError. It is transparent when the wrapped
-    stream is healthy.
+    catches ``OSError`` and closed-file ``ValueError`` probes. It is
+    transparent when the wrapped stream is healthy.
     """
 
     __slots__ = ("_inner",)
@@ -144,7 +144,10 @@ class _SafeWriter:
             pass
 
     def fileno(self):
-        return self._inner.fileno()
+        try:
+            return self._inner.fileno()
+        except (OSError, ValueError):
+            return -1
 
     def isatty(self):
         try:
