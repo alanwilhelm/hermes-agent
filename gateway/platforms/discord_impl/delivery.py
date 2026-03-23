@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -53,6 +54,53 @@ async def send_text_message(channel: Any, content: str, reference: Any = None) -
             )
             return await channel.send(content=content, reference=None)
         raise
+
+
+async def start_typing(
+    client: Any,
+    chat_id: str,
+    typing_tasks: dict[str, asyncio.Task],
+) -> None:
+    """Start a persistent typing indicator loop for a Discord channel."""
+    if not client or discord is None:
+        return
+    if chat_id in typing_tasks:
+        return
+
+    async def _typing_loop() -> None:
+        try:
+            while True:
+                try:
+                    route = discord.http.Route(
+                        "POST",
+                        "/channels/{channel_id}/typing",
+                        channel_id=chat_id,
+                    )
+                    await client.http.request(route)
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    logger.debug("Discord typing indicator failed for %s: %s", chat_id, exc)
+                    return
+                await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            pass
+
+    typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
+
+
+async def stop_typing(
+    chat_id: str,
+    typing_tasks: dict[str, asyncio.Task],
+) -> None:
+    """Stop a persistent typing indicator loop for a Discord channel."""
+    task = typing_tasks.pop(chat_id, None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def send_file_attachment(
