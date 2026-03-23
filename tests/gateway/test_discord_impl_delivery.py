@@ -1,3 +1,4 @@
+import asyncio
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import importlib
@@ -190,3 +191,54 @@ async def test_send_file_attachment_returns_channel_not_found_error(tmp_path):
 
     assert result.success is False
     assert result.error == "Channel 123 not found"
+
+
+@pytest.mark.asyncio
+async def test_start_typing_posts_typing_route_and_tracks_task(monkeypatch):
+    request = AsyncMock()
+    client = SimpleNamespace(http=SimpleNamespace(request=request))
+    route_cls = MagicMock(return_value="typing-route")
+    typing_tasks = {}
+    sleep_started = asyncio.Event()
+
+    async def fake_sleep(seconds):
+        assert seconds == 8
+        sleep_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(delivery.discord.http, "Route", route_cls)
+    monkeypatch.setattr(delivery.asyncio, "sleep", fake_sleep)
+
+    await delivery.start_typing(client, "123", typing_tasks)
+    assert "123" in typing_tasks
+
+    await asyncio.wait_for(sleep_started.wait(), timeout=1)
+    route_cls.assert_called_once_with(
+        "POST",
+        "/channels/{channel_id}/typing",
+        channel_id="123",
+    )
+    request.assert_awaited_once_with("typing-route")
+
+    await delivery.stop_typing("123", typing_tasks)
+    assert "123" not in typing_tasks
+
+
+@pytest.mark.asyncio
+async def test_start_typing_ignores_duplicate_requests(monkeypatch):
+    request = AsyncMock()
+    client = SimpleNamespace(http=SimpleNamespace(request=request))
+    typing_tasks = {"123": MagicMock()}
+
+    route_cls = MagicMock()
+    monkeypatch.setattr(delivery.discord.http, "Route", route_cls)
+
+    await delivery.start_typing(client, "123", typing_tasks)
+
+    route_cls.assert_not_called()
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_ignores_missing_task():
+    await delivery.stop_typing("missing", {})

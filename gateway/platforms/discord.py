@@ -1314,19 +1314,15 @@ class DiscordAdapter(BasePlatformAdapter):
         8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
         stop_typing() is called (after the response is sent).
         """
-        if not self._client:
-            return
-        # Don't start a duplicate loop
-        if chat_id in self._typing_tasks:
-            return
+        await discord_delivery.start_typing(
+            self._client,
+            chat_id,
+            self._typing_tasks,
+        )
 
-        async def _typing_loop() -> None:
-            try:
-                channel = await discord_delivery.resolve_channel(self._client, chat_id)
-                if channel:
-                    await channel.typing()
-            except Exception:
-                pass  # Ignore typing indicator failures
+    async def stop_typing(self, chat_id: str) -> None:
+        """Stop the persistent typing indicator for a channel."""
+        await discord_delivery.stop_typing(chat_id, self._typing_tasks)
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
