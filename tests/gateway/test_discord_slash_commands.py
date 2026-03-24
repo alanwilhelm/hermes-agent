@@ -10,19 +10,39 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_discord_mock():
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+    if "discord" in sys.modules and "mock-discord.py" not in str(getattr(sys.modules["discord"], "__file__", "")):
         return
 
-    discord_mod = MagicMock()
-    discord_mod.Intents.default.return_value = MagicMock()
-    discord_mod.DMChannel = type("DMChannel", (), {})
-    discord_mod.Thread = type("Thread", (), {})
-    discord_mod.ForumChannel = type("ForumChannel", (), {})
-    discord_mod.Interaction = object
-    discord_mod.app_commands = SimpleNamespace(
-        describe=lambda **kwargs: (lambda fn: fn),
-        choices=lambda **kwargs: (lambda fn: fn),
-        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+    discord_mod = sys.modules.get("discord")
+    if discord_mod is None:
+        discord_mod = MagicMock()
+        discord_mod.__file__ = "mock-discord.py"
+        sys.modules["discord"] = discord_mod
+
+    if not hasattr(discord_mod, "__file__"):
+        discord_mod.__file__ = "mock-discord.py"
+    if not hasattr(discord_mod, "Intents"):
+        discord_mod.Intents = MagicMock()
+    if not hasattr(discord_mod.Intents, "default"):
+        discord_mod.Intents.default = MagicMock(return_value=MagicMock())
+    elif not callable(discord_mod.Intents.default):
+        discord_mod.Intents.default = MagicMock(return_value=MagicMock())
+    if not hasattr(discord_mod, "DMChannel"):
+        discord_mod.DMChannel = type("DMChannel", (), {})
+    if not hasattr(discord_mod, "Thread"):
+        discord_mod.Thread = type("Thread", (), {})
+    if not hasattr(discord_mod, "ForumChannel"):
+        discord_mod.ForumChannel = type("ForumChannel", (), {})
+    if not hasattr(discord_mod, "Interaction"):
+        discord_mod.Interaction = object
+    if not hasattr(discord_mod, "app_commands"):
+        discord_mod.app_commands = SimpleNamespace()
+    discord_mod.app_commands.describe = getattr(discord_mod.app_commands, "describe", lambda **kwargs: (lambda fn: fn))
+    discord_mod.app_commands.choices = getattr(discord_mod.app_commands, "choices", lambda **kwargs: (lambda fn: fn))
+    discord_mod.app_commands.Choice = getattr(
+        discord_mod.app_commands,
+        "Choice",
+        lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
     ext_mod = MagicMock()
@@ -30,7 +50,6 @@ def _ensure_discord_mock():
     commands_mod.Bot = MagicMock
     ext_mod.commands = commands_mod
 
-    sys.modules.setdefault("discord", discord_mod)
     sys.modules.setdefault("discord.ext", ext_mod)
     sys.modules.setdefault("discord.ext.commands", commands_mod)
 

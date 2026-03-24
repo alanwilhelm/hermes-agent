@@ -114,6 +114,12 @@ def _load_components_module():
     discord_mod = ModuleType("discord")
     discord_mod.__file__ = "mock-discord.py"
     discord_mod.Message = type("Message", (), {})
+    discord_mod.Intents = SimpleNamespace(default=lambda: SimpleNamespace())
+    discord_mod.Client = object
+    discord_mod.File = object
+    discord_mod.DMChannel = type("DMChannel", (), {})
+    discord_mod.Thread = type("Thread", (), {})
+    discord_mod.ForumChannel = type("ForumChannel", (), {})
     discord_mod.Interaction = object
     discord_mod.ui = SimpleNamespace(
         View=FakeView,
@@ -138,6 +144,20 @@ def _load_components_module():
     )
     discord_mod.SelectOption = lambda **kwargs: SimpleNamespace(**kwargs)
     discord_mod.TextStyle = SimpleNamespace(short="short", paragraph="paragraph")
+    discord_mod.MessageType = SimpleNamespace(
+        default="default",
+        reply="reply",
+        channel_name_change="channel_name_change",
+        pins_add="pins_add",
+        new_member="new_member",
+        premium_guild_subscription="premium_guild_subscription",
+        recipient_add="recipient_add",
+    )
+    discord_mod.app_commands = SimpleNamespace(
+        describe=lambda **kwargs: (lambda fn: fn),
+        choices=lambda **kwargs: (lambda fn: fn),
+        Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
 
     sys.modules["discord"] = discord_mod
     return importlib.reload(importlib.import_module("gateway.platforms.discord_impl.components"))
