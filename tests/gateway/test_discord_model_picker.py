@@ -308,7 +308,9 @@ async def test_picker_select_and_submit_flow_applies_pending_model(monkeypatch, 
     )
 
     _content, provider_view = controller._build_provider_view()
-    provider_select = next(child for child in provider_view.children if isinstance(child, FakeSelect))
+    provider_select = next(
+        child for child in provider_view.children if getattr(child, "placeholder", None) == "Choose a provider"
+    )
     interaction = _interaction(message_id="321")
     provider_select.values = ["anthropic"]
     await provider_select.callback(interaction)
@@ -317,7 +319,9 @@ async def test_picker_select_and_submit_flow_applies_pending_model(monkeypatch, 
     assert interaction.response.edit_message.await_count == 1
 
     _content, model_view = controller._build_model_view()
-    model_select = next(child for child in model_view.children if isinstance(child, FakeSelect))
+    model_select = next(
+        child for child in model_view.children if getattr(child, "placeholder", None) == "Choose a model"
+    )
     model_select.values = ["claude-sonnet-4-6"]
     await model_select.callback(interaction)
 

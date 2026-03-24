@@ -196,6 +196,15 @@ def _load_interactions_module():
     discord_mod.FFmpegPCMAudio = MagicMock
     discord_mod.PCMVolumeTransformer = MagicMock
     discord_mod.http = SimpleNamespace(Route=MagicMock)
+    discord_mod.MessageType = SimpleNamespace(
+        default="default",
+        reply="reply",
+        channel_name_change="channel_name_change",
+        pins_add="pins_add",
+        new_member="new_member",
+        premium_guild_subscription="premium_guild_subscription",
+        recipient_add="recipient_add",
+    )
 
     sys.modules["discord"] = discord_mod
     ext_mod = ModuleType("discord.ext")
