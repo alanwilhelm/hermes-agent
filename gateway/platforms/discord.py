@@ -2555,10 +2555,22 @@ class DiscordAdapter(BasePlatformAdapter):
         # (can happen when user sends @mention-only with no other text)
         if not event_text or not event_text.strip():
             event_text = "(The user sent a message with no text content)"
+        if event_text.startswith("/"):
+            effective_msg_type = MessageType.COMMAND
+        elif any(mt.startswith("image/") for mt in media_types):
+            effective_msg_type = MessageType.PHOTO
+        elif any(mt.startswith("video/") for mt in media_types):
+            effective_msg_type = MessageType.VIDEO
+        elif any(mt.startswith("audio/") for mt in media_types):
+            effective_msg_type = MessageType.AUDIO
+        elif media_urls:
+            effective_msg_type = MessageType.DOCUMENT
+        else:
+            effective_msg_type = MessageType.TEXT
 
         event = MessageEvent(
             text=event_text,
-            message_type=msg_type,
+            message_type=effective_msg_type,
             source=source,
             raw_message=message,
             message_id=str(message.id),

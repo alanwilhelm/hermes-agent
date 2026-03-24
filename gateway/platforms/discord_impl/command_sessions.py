@@ -7,6 +7,7 @@ import re
 from typing import Any, Optional, Tuple
 
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.discord_impl.intake import get_parent_channel_id
 
 try:
     import discord
@@ -42,7 +43,9 @@ def _resolve_target_chat(adapter: Any, interaction: Any) -> tuple[str, str, Opti
     is_dm = isinstance(channel, dm_channel_cls) if dm_channel_cls else False
     is_thread = isinstance(channel, thread_cls) if thread_cls else False
     explicit_parent = getattr(channel, "__dict__", {}).get("parent")
-    if not is_thread and not is_dm and explicit_parent is not None:
+    if not is_dm and not is_thread and (
+        explicit_parent is not None or get_parent_channel_id(channel) is not None
+    ):
         # Test doubles and reloaded discord mocks can break direct isinstance
         # checks while still representing a real thread-like channel.
         is_thread = True

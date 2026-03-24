@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 from types import SimpleNamespace
 
@@ -6,11 +7,16 @@ import pytest
 
 
 def _real_discord_available() -> bool:
+    removed = {}
+    for name in ("discord", "discord.ext", "discord.ext.commands"):
+        if name in sys.modules:
+            removed[name] = sys.modules.pop(name)
+
     try:
-        importlib.import_module("discord")
-        return True
-    except ImportError:
-        return False
+        spec = importlib.util.find_spec("discord")
+        return isinstance(getattr(spec, "origin", None), str)
+    finally:
+        sys.modules.update(removed)
 
 
 @pytest.mark.skipif(not _real_discord_available(), reason="discord.py not installed")
