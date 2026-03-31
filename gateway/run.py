@@ -234,7 +234,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
-from gateway.delivery import DeliveryRouter
+from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.command_catalog import (
     build_session_export_html,
@@ -5840,7 +5840,6 @@ class GatewayRunner:
         if not entries:
             return "No commands available."
 
-        from gateway.config import Platform
         page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
         total_pages = max(1, (len(entries) + page_size - 1) // page_size)
         page = max(1, min(requested_page, total_pages))
@@ -8179,7 +8178,7 @@ class GatewayRunner:
             # (preserving its full transcript in SQLite) and creates a new
             # session_id for the continuation.  Write the compressed messages
             # into the NEW session so the original history stays searchable.
-            new_session_id = tmp_agent.session_id
+            new_session_id = getattr(tmp_agent, "session_id", session_entry.session_id)
             if new_session_id != session_entry.session_id:
                 session_entry.session_id = new_session_id
                 self.session_store._save()
