@@ -11,9 +11,224 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from honcho_integration.client import resolve_config_path, GLOBAL_CONFIG_PATH
+from honcho_integration.client import resolve_active_host, resolve_config_path, GLOBAL_CONFIG_PATH, HOST
 
-HOST = "hermes"
+
+def clone_honcho_for_profile(profile_name: str) -> bool:
+    """Auto-clone Honcho config for a new profile from the default host block.
+
+    Called during profile creation. If Honcho is configured on the default
+    host, creates a new host block for the profile with inherited settings
+    and auto-derived workspace/aiPeer.
+
+    Returns True if a host block was created, False if Honcho isn't configured.
+    """
+    cfg = _read_config()
+    if not cfg:
+        return False
+
+    hosts = cfg.get("hosts", {})
+    default_block = hosts.get(HOST, {})
+
+    # No default host block and no root-level API key = Honcho not configured
+    has_key = bool(cfg.get("apiKey") or os.environ.get("HONCHO_API_KEY"))
+    if not default_block and not has_key:
+        return False
+
+    new_host = f"{HOST}.{profile_name}"
+    if new_host in hosts:
+        return False  # already exists
+
+    # Clone settings from default block, override identity fields
+    new_block = {}
+    for key in ("memoryMode", "recallMode", "writeFrequency", "sessionStrategy",
+                "sessionPeerPrefix", "contextTokens", "dialecticReasoningLevel",
+                "dialecticMaxChars", "saveMessages"):
+        val = default_block.get(key)
+        if val is not None:
+            new_block[key] = val
+
+    # Inherit peer name from default
+    peer_name = default_block.get("peerName") or cfg.get("peerName")
+    if peer_name:
+        new_block["peerName"] = peer_name
+
+    # AI peer is profile-specific; workspace is shared so all profiles
+    # see the same user context, sessions, and project history.
+    new_block["aiPeer"] = new_host
+    new_block["workspace"] = default_block.get("workspace") or cfg.get("workspace") or HOST
+    new_block["enabled"] = default_block.get("enabled", True)
+
+    cfg.setdefault("hosts", {})[new_host] = new_block
+    _write_config(cfg)
+
+    # Eagerly create the peer in Honcho so it exists before first message
+    _ensure_peer_exists(new_host)
+    return True
+
+
+def _ensure_peer_exists(host_key: str | None = None) -> bool:
+    """Create the AI peer in Honcho if it doesn't already exist.
+
+    Idempotent -- safe to call multiple times. Returns True if the peer
+    was created or already exists, False on failure.
+    """
+    try:
+        from honcho_integration.client import HonchoClientConfig, get_honcho_client
+        hcfg = HonchoClientConfig.from_global_config(host=host_key)
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            return False
+        client = get_honcho_client(hcfg)
+        # peer() is idempotent -- creates if missing, returns if exists
+        client.peer(hcfg.ai_peer)
+        if hcfg.peer_name:
+            client.peer(hcfg.peer_name)
+        return True
+    except Exception:
+        return False
+
+
+def cmd_enable(args) -> None:
+    """Enable Honcho for the active profile."""
+    cfg = _read_config()
+    host = _host_key()
+    label = f"[{host}] " if host != "hermes" else ""
+    block = cfg.setdefault("hosts", {}).setdefault(host, {})
+
+    if block.get("enabled") is True:
+        print(f"  {label}Honcho is already enabled.\n")
+        return
+
+    block["enabled"] = True
+
+    # If this is a new profile host block with no settings, clone from default
+    if not block.get("aiPeer"):
+        default_block = cfg.get("hosts", {}).get(HOST, {})
+        for key in ("memoryMode", "recallMode", "writeFrequency", "sessionStrategy",
+                    "contextTokens", "dialecticReasoningLevel", "dialecticMaxChars"):
+            val = default_block.get(key)
+            if val is not None and key not in block:
+                block[key] = val
+        peer_name = default_block.get("peerName") or cfg.get("peerName")
+        if peer_name and "peerName" not in block:
+            block["peerName"] = peer_name
+        block.setdefault("aiPeer", host)
+        block.setdefault("workspace", default_block.get("workspace") or cfg.get("workspace") or HOST)
+
+    _write_config(cfg)
+    print(f"  {label}Honcho enabled.")
+
+    # Create peer eagerly
+    if _ensure_peer_exists(host):
+        print(f"  {label}Peer '{block.get('aiPeer', host)}' ready.")
+    else:
+        print(f"  {label}Peer creation deferred (no connection).")
+
+    print(f"  Saved to {_config_path()}\n")
+
+
+def cmd_disable(args) -> None:
+    """Disable Honcho for the active profile."""
+    cfg = _read_config()
+    host = _host_key()
+    label = f"[{host}] " if host != "hermes" else ""
+    block = cfg.get("hosts", {}).get(host, {})
+
+    if not block or block.get("enabled") is False:
+        print(f"  {label}Honcho is already disabled.\n")
+        return
+
+    block["enabled"] = False
+    _write_config(cfg)
+    print(f"  {label}Honcho disabled.")
+    print(f"  Saved to {_config_path()}\n")
+
+
+def cmd_sync(args) -> None:
+    """Sync Honcho config to all existing profiles.
+
+    Scans all Hermes profiles and creates host blocks for any that don't
+    have one yet. Inherits settings from the default host block.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+        profiles = list_profiles()
+    except Exception as e:
+        print(f"  Could not list profiles: {e}\n")
+        return
+
+    cfg = _read_config()
+    if not cfg:
+        print("  No Honcho config found. Run 'hermes honcho setup' first.\n")
+        return
+
+    hosts = cfg.get("hosts", {})
+    default_block = hosts.get(HOST, {})
+    has_key = bool(cfg.get("apiKey") or os.environ.get("HONCHO_API_KEY"))
+
+    if not default_block and not has_key:
+        print("  Honcho not configured on default profile. Run 'hermes honcho setup' first.\n")
+        return
+
+    created = 0
+    skipped = 0
+    for p in profiles:
+        if p.name == "default":
+            continue
+        if clone_honcho_for_profile(p.name):
+            print(f"  + {p.name} -> hermes.{p.name}")
+            created += 1
+        else:
+            skipped += 1
+
+    if created:
+        print(f"\n  {created} profile(s) synced.")
+    else:
+        print("  All profiles already have Honcho config.")
+    if skipped:
+        print(f"  {skipped} profile(s) already configured (skipped).")
+    print()
+
+
+def sync_honcho_profiles_quiet() -> int:
+    """Sync Honcho host blocks for all profiles. Returns count of newly created blocks.
+
+    Called from `hermes update` -- no output, no exceptions.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+        profiles = list_profiles()
+    except Exception:
+        return 0
+
+    cfg = _read_config()
+    if not cfg:
+        return 0
+
+    default_block = cfg.get("hosts", {}).get(HOST, {})
+    has_key = bool(cfg.get("apiKey") or os.environ.get("HONCHO_API_KEY"))
+    if not default_block and not has_key:
+        return 0
+
+    created = 0
+    for p in profiles:
+        if p.name == "default":
+            continue
+        if clone_honcho_for_profile(p.name):
+            created += 1
+    return created
+
+
+_profile_override: str | None = None
+
+
+def _host_key() -> str:
+    """Return the active Honcho host key, derived from the current Hermes profile."""
+    if _profile_override:
+        if _profile_override in ("default", "custom"):
+            return HOST
+        return f"{HOST}.{_profile_override}"
+    return resolve_active_host()
 
 
 def _config_path() -> Path:
@@ -52,7 +267,7 @@ def _write_config(cfg: dict, path: Path | None = None) -> None:
 
 def _resolve_api_key(cfg: dict) -> str:
     """Resolve API key with host -> root -> env fallback."""
-    host_key = ((cfg.get("hosts") or {}).get(HOST) or {}).get("apiKey")
+    host_key = ((cfg.get("hosts") or {}).get(_host_key()) or {}).get("apiKey")
     return host_key or cfg.get("apiKey", "") or os.environ.get("HONCHO_API_KEY", "")
 
 
@@ -118,10 +333,10 @@ def cmd_setup(args) -> None:
     if not _ensure_sdk_installed():
         return
 
-    # All writes go to hosts.hermes — root keys are managed by the user
-    # or the honcho CLI only.
+    # All writes go to the active host block — root keys are managed by
+    # the user or the honcho CLI only.
     hosts = cfg.setdefault("hosts", {})
-    hermes_host = hosts.setdefault(HOST, {})
+    hermes_host = hosts.setdefault(_host_key(), {})
 
     # API key — shared credential, lives at root so all hosts can read it
     current_key = cfg.get("apiKey", "")
@@ -148,7 +363,7 @@ def cmd_setup(args) -> None:
     if new_workspace:
         hermes_host["workspace"] = new_workspace
 
-    hermes_host.setdefault("aiPeer", HOST)
+    hermes_host.setdefault("aiPeer", _host_key())
 
     # Memory mode
     current_mode = hermes_host.get("memoryMode") or cfg.get("memoryMode", "hybrid")
@@ -237,8 +452,53 @@ def cmd_setup(args) -> None:
     print("    hermes honcho map <name> — map this directory to a session name\n")
 
 
+def _active_profile_name() -> str:
+    """Return the active Hermes profile name (respects --target-profile override)."""
+    if _profile_override:
+        return _profile_override
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name()
+    except Exception:
+        return "default"
+
+
+def _all_profile_host_configs() -> list[tuple[str, str, dict]]:
+    """Return (profile_name, host_key, host_block) for every known profile.
+
+    Reads honcho.json once and maps each profile to its host block.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+        profiles = list_profiles()
+    except Exception:
+        return [(_active_profile_name(), _host_key(), {})]
+
+    cfg = _read_config()
+    hosts = cfg.get("hosts", {})
+    results = []
+
+    # Default profile
+    default_block = hosts.get(HOST, {})
+    results.append(("default", HOST, default_block))
+
+    for p in profiles:
+        if p.name == "default":
+            continue
+        h = f"{HOST}.{p.name}"
+        results.append((p.name, h, hosts.get(h, {})))
+
+    return results
+
+
 def cmd_status(args) -> None:
     """Show current Honcho config and connection status."""
+    show_all = getattr(args, "all", False)
+
+    if show_all:
+        _cmd_status_all()
+        return
+
     try:
         import honcho  # noqa: F401
     except ImportError:
@@ -265,11 +525,16 @@ def cmd_status(args) -> None:
     api_key = hcfg.api_key or ""
     masked = f"...{api_key[-8:]}" if len(api_key) > 8 else ("set" if api_key else "not set")
 
-    print("\nHoncho status\n" + "─" * 40)
+    profile = _active_profile_name()
+    profile_label = f" [{hcfg.host}]" if profile != "default" else ""
+
+    print(f"\nHoncho status{profile_label}\n" + "─" * 40)
+    if profile != "default":
+        print(f"  Profile:        {profile}")
+    print(f"  Host:           {hcfg.host}")
     print(f"  Enabled:        {hcfg.enabled}")
     print(f"  API key:        {masked}")
     print(f"  Workspace:      {hcfg.workspace_id}")
-    print(f"  Host:           {hcfg.host}")
     print(f"  Config path:    {active_path}")
     if write_path != active_path:
         print(f"  Write path:     {write_path}  (instance-local)")
@@ -287,13 +552,98 @@ def cmd_status(args) -> None:
     if hcfg.enabled and (hcfg.api_key or hcfg.base_url):
         print("\n  Connection... ", end="", flush=True)
         try:
-            get_honcho_client(hcfg)
-            print("OK\n")
+            client = get_honcho_client(hcfg)
+            print("OK")
+            _show_peer_cards(hcfg, client)
         except Exception as e:
             print(f"FAILED ({e})\n")
     else:
         reason = "disabled" if not hcfg.enabled else "no API key or base URL"
         print(f"\n  Not connected ({reason})\n")
+
+
+def _show_peer_cards(hcfg, client) -> None:
+    """Fetch and display peer cards for the active profile.
+
+    Uses get_or_create to ensure the session exists with peers configured.
+    This is idempotent -- if the session already exists on the server it's
+    just retrieved, not duplicated.
+    """
+    try:
+        from honcho_integration.session import HonchoSessionManager
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name()
+        mgr.get_or_create(session_key)
+
+        # User peer card
+        card = mgr.get_peer_card(session_key)
+        if card:
+            print(f"\n  User peer card ({len(card)} facts):")
+            for fact in card[:10]:
+                print(f"    - {fact}")
+            if len(card) > 10:
+                print(f"    ... and {len(card) - 10} more")
+
+        # AI peer representation
+        ai_rep = mgr.get_ai_representation(session_key)
+        ai_text = ai_rep.get("representation", "")
+        if ai_text:
+            # Truncate to first 200 chars
+            display = ai_text[:200] + ("..." if len(ai_text) > 200 else "")
+            print(f"\n  AI peer representation:")
+            print(f"    {display}")
+
+        if not card and not ai_text:
+            print("\n  No peer data yet (accumulates after first conversation)")
+
+        print()
+    except Exception as e:
+        print(f"\n  Peer data unavailable: {e}\n")
+
+
+def _cmd_status_all() -> None:
+    """Show Honcho config overview across all profiles."""
+    rows = _all_profile_host_configs()
+    cfg = _read_config()
+    active = _active_profile_name()
+
+    print(f"\nHoncho profiles ({len(rows)})\n" + "─" * 60)
+    print(f"  {'Profile':<14} {'Host':<22} {'Enabled':<9} {'Mode':<9} {'Recall':<9} {'Write'}")
+    print(f"  {'─' * 14} {'─' * 22} {'─' * 9} {'─' * 9} {'─' * 9} {'─' * 9}")
+
+    for name, host, block in rows:
+        enabled = block.get("enabled", cfg.get("enabled"))
+        if enabled is None:
+            # Auto-enable check: any credentials?
+            has_creds = bool(cfg.get("apiKey") or os.environ.get("HONCHO_API_KEY"))
+            enabled = has_creds if block else False
+        enabled_str = "yes" if enabled else "no"
+
+        mode = block.get("memoryMode") or cfg.get("memoryMode", "hybrid")
+        recall = block.get("recallMode") or cfg.get("recallMode", "hybrid")
+        write = block.get("writeFrequency") or cfg.get("writeFrequency", "async")
+
+        marker = " *" if name == active else ""
+        print(f"  {name + marker:<14} {host:<22} {enabled_str:<9} {mode:<9} {recall:<9} {write}")
+
+    print(f"\n  * active profile\n")
+
+
+def cmd_peers(args) -> None:
+    """Show peer identities across all profiles."""
+    rows = _all_profile_host_configs()
+    cfg = _read_config()
+
+    print(f"\nHoncho peer identities ({len(rows)} profiles)\n" + "─" * 50)
+    print(f"  {'Profile':<14} {'User peer':<16} {'AI peer'}")
+    print(f"  {'─' * 14} {'─' * 16} {'─' * 18}")
+
+    for name, host, block in rows:
+        user = block.get("peerName") or cfg.get("peerName") or "(not set)"
+        ai = block.get("aiPeer") or cfg.get("aiPeer") or host
+        print(f"  {name:<14} {user:<16} {ai}")
+
+    print()
 
 
 def cmd_sessions(args) -> None:
@@ -354,9 +704,9 @@ def cmd_peer(args) -> None:
     if user_name is None and ai_name is None and reasoning is None:
         # Show current values
         hosts = cfg.get("hosts", {})
-        hermes = hosts.get(HOST, {})
+        hermes = hosts.get(_host_key(), {})
         user = hermes.get('peerName') or cfg.get('peerName') or '(not set)'
-        ai = hermes.get('aiPeer') or cfg.get('aiPeer') or HOST
+        ai = hermes.get('aiPeer') or cfg.get('aiPeer') or _host_key()
         lvl = hermes.get("dialecticReasoningLevel") or cfg.get("dialecticReasoningLevel") or "low"
         max_chars = hermes.get("dialecticMaxChars") or cfg.get("dialecticMaxChars") or 600
         print("\nHoncho peers\n" + "─" * 40)
@@ -370,23 +720,26 @@ def cmd_peer(args) -> None:
         print(f"  Dialectic cap:        {max_chars} chars\n")
         return
 
+    host = _host_key()
+    label = f"[{host}] " if host != "hermes" else ""
+
     if user_name is not None:
-        cfg.setdefault("hosts", {}).setdefault(HOST, {})["peerName"] = user_name.strip()
+        cfg.setdefault("hosts", {}).setdefault(host, {})["peerName"] = user_name.strip()
         changed = True
-        print(f"  User peer → {user_name.strip()}")
+        print(f"  {label}User peer -> {user_name.strip()}")
 
     if ai_name is not None:
-        cfg.setdefault("hosts", {}).setdefault(HOST, {})["aiPeer"] = ai_name.strip()
+        cfg.setdefault("hosts", {}).setdefault(host, {})["aiPeer"] = ai_name.strip()
         changed = True
-        print(f"  AI peer   → {ai_name.strip()}")
+        print(f"  {label}AI peer   -> {ai_name.strip()}")
 
     if reasoning is not None:
         if reasoning not in REASONING_LEVELS:
             print(f"  Invalid reasoning level '{reasoning}'. Options: {', '.join(REASONING_LEVELS)}")
             return
-        cfg.setdefault("hosts", {}).setdefault(HOST, {})["dialecticReasoningLevel"] = reasoning
+        cfg.setdefault("hosts", {}).setdefault(host, {})["dialecticReasoningLevel"] = reasoning
         changed = True
-        print(f"  Dialectic reasoning level → {reasoning}")
+        print(f"  {label}Dialectic reasoning level -> {reasoning}")
 
     if changed:
         _write_config(cfg)
@@ -404,7 +757,7 @@ def cmd_mode(args) -> None:
 
     if mode_arg is None:
         current = (
-            (cfg.get("hosts") or {}).get(HOST, {}).get("memoryMode")
+            (cfg.get("hosts") or {}).get(_host_key(), {}).get("memoryMode")
             or cfg.get("memoryMode")
             or "hybrid"
         )
@@ -419,16 +772,18 @@ def cmd_mode(args) -> None:
         print(f"  Invalid mode '{mode_arg}'. Options: {', '.join(MODES)}\n")
         return
 
-    cfg.setdefault("hosts", {}).setdefault(HOST, {})["memoryMode"] = mode_arg
+    host = _host_key()
+    label = f"[{host}] " if host != "hermes" else ""
+    cfg.setdefault("hosts", {}).setdefault(host, {})["memoryMode"] = mode_arg
     _write_config(cfg)
-    print(f"  Memory mode → {mode_arg}  ({MODES[mode_arg]})\n")
+    print(f"  {label}Memory mode -> {mode_arg}  ({MODES[mode_arg]})\n")
 
 
 def cmd_tokens(args) -> None:
     """Show or set token budget settings."""
     cfg = _read_config()
     hosts = cfg.get("hosts", {})
-    hermes = hosts.get(HOST, {})
+    hermes = hosts.get(_host_key(), {})
 
     context = getattr(args, "context", None)
     dialectic = getattr(args, "dialectic", None)
@@ -451,14 +806,16 @@ def cmd_tokens(args) -> None:
         print("\n  Set with: hermes honcho tokens [--context N] [--dialectic N]\n")
         return
 
+    host = _host_key()
+    label = f"[{host}] " if host != "hermes" else ""
     changed = False
     if context is not None:
-        cfg.setdefault("hosts", {}).setdefault(HOST, {})["contextTokens"] = context
-        print(f"  context tokens → {context}")
+        cfg.setdefault("hosts", {}).setdefault(host, {})["contextTokens"] = context
+        print(f"  {label}context tokens -> {context}")
         changed = True
     if dialectic is not None:
-        cfg.setdefault("hosts", {}).setdefault(HOST, {})["dialecticMaxChars"] = dialectic
-        print(f"  dialectic cap  → {dialectic} chars")
+        cfg.setdefault("hosts", {}).setdefault(host, {})["dialecticMaxChars"] = dialectic
+        print(f"  {label}dialectic cap  -> {dialectic} chars")
         changed = True
 
     if changed:
@@ -770,11 +1127,16 @@ def cmd_migrate(args) -> None:
 
 def honcho_command(args) -> None:
     """Route honcho subcommands."""
+    global _profile_override
+    _profile_override = getattr(args, "target_profile", None)
+
     sub = getattr(args, "honcho_command", None)
     if sub == "setup" or sub is None:
         cmd_setup(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "peers":
+        cmd_peers(args)
     elif sub == "sessions":
         cmd_sessions(args)
     elif sub == "map":
@@ -789,6 +1151,12 @@ def honcho_command(args) -> None:
         cmd_identity(args)
     elif sub == "migrate":
         cmd_migrate(args)
+    elif sub == "enable":
+        cmd_enable(args)
+    elif sub == "disable":
+        cmd_disable(args)
+    elif sub == "sync":
+        cmd_sync(args)
     else:
         print(f"  Unknown honcho command: {sub}")
-        print("  Available: setup, status, sessions, map, peer, mode, tokens, identity, migrate\n")
+        print("  Available: setup, status, sessions, map, peer, mode, tokens, identity, migrate, enable, disable, sync\n")

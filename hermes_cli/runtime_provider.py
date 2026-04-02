@@ -71,7 +71,7 @@ def _get_model_config() -> Dict[str, Any]:
         default = (cfg.get("default") or "").strip()
         base_url = (cfg.get("base_url") or "").strip()
         is_local = "localhost" in base_url or "127.0.0.1" in base_url
-        is_fallback = not default or default == "anthropic/claude-opus-4.6"
+        is_fallback = not default
         if is_local and is_fallback and base_url:
             detected = _auto_detect_local_model(base_url)
             if detected:
@@ -82,9 +82,27 @@ def _get_model_config() -> Dict[str, Any]:
     return {}
 
 
+def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
+    """Check whether a persisted api_mode should be honored for a given provider.
+
+    Prevents stale api_mode from a previous provider leaking into a
+    different one after a model/provider switch.  Only applies the
+    persisted mode when the config's provider matches the runtime
+    provider (or when no configured provider is recorded).
+    """
+    normalized_provider = (provider or "").strip().lower()
+    normalized_configured = (configured_provider or "").strip().lower()
+    if not normalized_configured:
+        return True
+    if normalized_provider == "custom":
+        return normalized_configured == "custom" or normalized_configured.startswith("custom:")
+    return normalized_configured == normalized_provider
+
+
 def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
     configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-    if configured_mode:
+    if configured_mode and _provider_supports_explicit_api_mode("copilot", configured_provider):
         return configured_mode
 
     model_name = str(model_cfg.get("default") or "").strip()
@@ -133,14 +151,20 @@ def _resolve_runtime_from_pool_entry(
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+    elif provider == "openrouter":
+        base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "nous":
         api_mode = "chat_completions"
     elif provider == "copilot":
         api_mode = _copilot_runtime_api_mode(model_cfg, getattr(entry, "runtime_api_key", ""))
     else:
+        configured_provider = str(model_cfg.get("provider") or "").strip().lower()
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-        if configured_mode:
+        if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
             api_mode = configured_mode
+        elif provider in ("opencode-zen", "opencode-go"):
+            from hermes_cli.models import opencode_model_api_mode
+            api_mode = opencode_model_api_mode(provider, model_cfg.get("default", ""))
         elif base_url.rstrip("/").endswith("/anthropic"):
             api_mode = "anthropic_messages"
 
@@ -664,10 +688,14 @@ def resolve_runtime_provider(
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         else:
-            # Check explicit api_mode from model config first
+            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+            # Only honor persisted api_mode when it belongs to the same provider family.
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
+            elif provider in ("opencode-zen", "opencode-go"):
+                from hermes_cli.models import opencode_model_api_mode
+                api_mode = opencode_model_api_mode(provider, model_cfg.get("default", ""))
             # Auto-detect Anthropic-compatible endpoints by URL convention
             # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
             elif base_url.rstrip("/").endswith("/anthropic"):

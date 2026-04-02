@@ -170,13 +170,21 @@ def _mock_tool_call(name="web_search", arguments="{}", call_id=None):
 
 
 def _mock_response(
-    content="Hello", finish_reason="stop", tool_calls=None, reasoning=None, usage=None
+    content="Hello",
+    finish_reason="stop",
+    tool_calls=None,
+    reasoning=None,
+    reasoning_content=None,
+    reasoning_details=None,
+    usage=None,
 ):
     """Return a SimpleNamespace mimicking an OpenAI ChatCompletion response."""
     msg = _mock_assistant_msg(
         content=content,
         tool_calls=tool_calls,
         reasoning=reasoning,
+        reasoning_content=reasoning_content,
+        reasoning_details=reasoning_details,
     )
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     resp = SimpleNamespace(choices=[choice], model="test/model")
@@ -411,8 +419,9 @@ class TestInit:
             patch("run_agent.OpenAI"),
         ):
             a = AIAgent(
-                api_key="test-key-1234567890",
+                api_key="test-k...7890",
                 model="anthropic/claude-sonnet-4-20250514",
+                base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -605,6 +614,11 @@ class TestBuildSystemPrompt:
         # Should contain current date info like "Conversation started:"
         assert "Conversation started:" in prompt
 
+    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
+        monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
+        prompt = agent._build_system_prompt()
+        assert "NOUS SUBSCRIPTION BLOCK" in prompt
+
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
         toolset_map = {
@@ -787,6 +801,7 @@ class TestBuildApiKwargs:
         assert kwargs["timeout"] == 1800.0
 
     def test_provider_preferences_injected(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
         agent.providers_allowed = ["Anthropic"]
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -794,6 +809,8 @@ class TestBuildApiKwargs:
 
     def test_reasoning_config_default_openrouter(self, agent):
         """Default reasoning config for OpenRouter should be medium."""
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.model = "anthropic/claude-sonnet-4-20250514"
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         reasoning = kwargs["extra_body"]["reasoning"]
@@ -801,6 +818,8 @@ class TestBuildApiKwargs:
         assert reasoning["effort"] == "medium"
 
     def test_reasoning_config_custom(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.model = "anthropic/claude-sonnet-4-20250514"
         agent.reasoning_config = {"enabled": False}
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -813,6 +832,7 @@ class TestBuildApiKwargs:
         assert "reasoning" not in kwargs.get("extra_body", {})
 
     def test_reasoning_sent_for_supported_openrouter_model(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "qwen/qwen3.5-plus-02-15"
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -1485,6 +1505,75 @@ class TestRunConversation:
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
         assert result["final_response"] == "internal reasoning"
+
+    def test_empty_content_local_resumed_session_triggers_compression(self, agent):
+        """Local resumed reasoning-only responses should compress before burning retries."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent.compression_enabled = True
+        empty_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="reasoning only",
+        )
+        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
+        prefill = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp, ok_resp]),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "compressed user message"}],
+                "compressed system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after compression"
+        assert result["api_calls"] == 1  # compression retry is refunded, same as explicit overflow path
+
+    def test_empty_content_repeated_structured_reasoning_salvages_early(self, agent):
+        """Repeated identical structured reasoning-only responses should stop retrying early."""
+        self._setup_agent(agent)
+        empty_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="structured reasoning answer",
+        )
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["final_response"] == "structured reasoning answer"
+        assert result["api_calls"] == 2
+
+    def test_empty_content_local_custom_error_is_actionable(self, agent):
+        """Local/custom retries should return a diagnostic tailored to context/endpoint mismatch."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp, empty_resp]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is False
+        assert "Local/custom backend returned reasoning-only output" in result["error"]
+        assert "wrong /v1 endpoint" in result["error"]
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
@@ -3151,9 +3240,11 @@ class TestStreamingApiCall:
     def test_api_exception_falls_back_to_non_streaming(self, agent):
         """When streaming fails before any deltas, fallback to non-streaming is attempted."""
         agent.client.chat.completions.create.side_effect = ConnectionError("fail")
-        # The fallback also uses the same client, so it'll fail too
-        with pytest.raises(ConnectionError, match="fail"):
-            agent._interruptible_streaming_api_call({"messages": []})
+        # Prevent stream retry logic from replacing the mock client
+        with patch.object(agent, "_replace_primary_openai_client", return_value=False):
+            # The fallback also uses the same client, so it'll fail too
+            with pytest.raises(ConnectionError, match="fail"):
+                agent._interruptible_streaming_api_call({"messages": []})
 
     def test_response_has_uuid_id(self, agent):
         chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
