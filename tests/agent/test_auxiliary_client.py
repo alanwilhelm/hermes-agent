@@ -23,6 +23,7 @@ from agent.auxiliary_client import (
     _resolve_forced_provider,
     _resolve_auto,
 )
+from hermes_cli.auth import AuthError
 
 
 @pytest.fixture(autouse=True)
@@ -74,14 +75,38 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result == "tok-123"
+
+    def test_prefers_codex_cli_auth(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        codex_home = tmp_path / "codex"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {"access_token": "tok-legacy", "refresh_token": "r-legacy"},
+                },
+            },
+        }))
+        (codex_home / "auth.json").write_text(json.dumps({
+            "tokens": {"access_token": "tok-cli", "refresh_token": "r-cli"},
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        result = _read_codex_access_token()
+        assert result == "tok-cli"
 
     def test_missing_returns_none(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result is None
 
@@ -97,50 +122,35 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result is None
 
-    def test_malformed_json_returns_none(self, tmp_path):
+    def test_malformed_json_returns_none(self, tmp_path, monkeypatch):
         codex_dir = tmp_path / ".codex"
         codex_dir.mkdir()
         (codex_dir / "auth.json").write_text("{bad json")
-        with patch("agent.auxiliary_client.Path.home", return_value=tmp_path):
-            result = _read_codex_access_token()
+        monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        result = _read_codex_access_token()
         assert result is None
 
-    def test_missing_tokens_key_returns_none(self, tmp_path):
+    def test_missing_tokens_key_returns_none(self, tmp_path, monkeypatch):
         codex_dir = tmp_path / ".codex"
         codex_dir.mkdir()
         (codex_dir / "auth.json").write_text(json.dumps({"other": "data"}))
-        with patch("agent.auxiliary_client.Path.home", return_value=tmp_path):
-            result = _read_codex_access_token()
+        monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        result = _read_codex_access_token()
         assert result is None
 
+    def test_resolver_failure_returns_none(self, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise AuthError("expired", provider="openai-codex", code="expired")
 
-    def test_expired_jwt_returns_none(self, tmp_path, monkeypatch):
-        """Expired JWT tokens should be skipped so auto chain continues."""
-        import base64
-        import time as _time
-
-        # Build a JWT with exp in the past
-        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", _boom)
         result = _read_codex_access_token()
-        assert result is None, "Expired JWT should return None"
+        assert result is None
 
     def test_valid_jwt_returns_token(self, tmp_path, monkeypatch):
         """Non-expired JWT tokens should be returned."""
@@ -163,6 +173,7 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result == valid_jwt
 
@@ -179,6 +190,7 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result == "plain-token-no-jwt"
 
@@ -243,26 +255,12 @@ class TestExpiredCodexFallback:
 
     def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
         """When Codex token is expired, auto chain should skip it and try next provider."""
-        import base64
-        import time as _time
-
-        # Expired Codex JWT
-        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_codex_runtime_credentials",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AuthError("expired", provider="openai-codex", code="expired")
+            ),
+        )
 
         # Set up Anthropic as fallback
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-test-fallback")
@@ -276,25 +274,12 @@ class TestExpiredCodexFallback:
 
     def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
         """With expired Codex + OpenRouter key, OpenRouter should win (1st in chain)."""
-        import base64
-        import time as _time
-
-        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_codex_runtime_credentials",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AuthError("expired", provider="openai-codex", code="expired")
+            ),
+        )
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
 
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
@@ -307,25 +292,12 @@ class TestExpiredCodexFallback:
 
     def test_expired_codex_custom_endpoint_wins(self, tmp_path, monkeypatch):
         """With expired Codex + custom endpoint (Ollama), custom should win (3rd in chain)."""
-        import base64
-        import time as _time
-
-        header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_codex_runtime_credentials",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AuthError("expired", provider="openai-codex", code="expired")
+            ),
+        )
 
         # Simulate Ollama or custom endpoint
         with patch("agent.auxiliary_client._resolve_custom_runtime",
@@ -369,6 +341,7 @@ class TestExpiredCodexFallback:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result == no_exp_jwt, "JWT without exp should pass through"
 
@@ -390,6 +363,7 @@ class TestExpiredCodexFallback:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
         result = _read_codex_access_token()
         assert result == bad_jwt, "JWT with invalid JSON payload should pass through"
 
@@ -618,6 +592,7 @@ class TestVisionClientFallback:
     def test_vision_returns_none_without_any_credentials(self):
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
+            patch("agent.auxiliary_client._read_codex_access_token", return_value=None),
             patch("agent.auxiliary_client._try_anthropic", return_value=(None, None)),
         ):
             client, model = get_vision_auxiliary_client()
@@ -706,6 +681,7 @@ class TestAuxiliaryPoolAwareness:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-key")
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
+            patch("agent.auxiliary_client._read_codex_access_token", return_value=None),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-api03-key"),
         ):
@@ -988,6 +964,7 @@ class TestResolveForcedProvider:
         assert model == "my-local-model"
 
     def test_forced_main_falls_to_codex(self, codex_auth_dir, monkeypatch):
+        monkeypatch.setattr("agent.auxiliary_client._resolve_custom_runtime", lambda: (None, None))
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = _resolve_forced_provider("main")

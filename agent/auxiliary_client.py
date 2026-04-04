@@ -576,37 +576,25 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store."""
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        return token or None
-
+    """Read the current Codex access token via the shared runtime resolver."""
     try:
-        from hermes_cli.auth import _read_codex_tokens
-        data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+
+        creds = resolve_codex_runtime_credentials()
+        access_token = creds.get("api_key")
         if not isinstance(access_token, str) or not access_token.strip():
+            pool_present, entry = _select_pool_entry("openai-codex")
+            if pool_present:
+                token = _pool_runtime_api_key(entry)
+                return token or None
             return None
-
-        # Check JWT expiry — expired tokens block the auto chain and
-        # prevent fallback to working providers (e.g. Anthropic).
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
-
         return access_token.strip()
     except Exception as exc:
         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
+        pool_present, entry = _select_pool_entry("openai-codex")
+        if pool_present:
+            token = _pool_runtime_api_key(entry)
+            return token or None
         return None
 
 
