@@ -27,23 +27,20 @@ def _ensure_discord_mock():
         discord_mod.Intents.default = MagicMock(return_value=MagicMock())
     elif not callable(discord_mod.Intents.default):
         discord_mod.Intents.default = MagicMock(return_value=MagicMock())
-    if not hasattr(discord_mod, "DMChannel"):
+    if not isinstance(getattr(discord_mod, "DMChannel", None), type):
         discord_mod.DMChannel = type("DMChannel", (), {})
-    if not hasattr(discord_mod, "Thread"):
+    if not isinstance(getattr(discord_mod, "Thread", None), type):
         discord_mod.Thread = type("Thread", (), {})
-    if not hasattr(discord_mod, "ForumChannel"):
+    if not isinstance(getattr(discord_mod, "ForumChannel", None), type):
         discord_mod.ForumChannel = type("ForumChannel", (), {})
     if not hasattr(discord_mod, "Interaction"):
         discord_mod.Interaction = object
     if not hasattr(discord_mod, "app_commands"):
         discord_mod.app_commands = SimpleNamespace()
-    discord_mod.app_commands.describe = getattr(discord_mod.app_commands, "describe", lambda **kwargs: (lambda fn: fn))
-    discord_mod.app_commands.choices = getattr(discord_mod.app_commands, "choices", lambda **kwargs: (lambda fn: fn))
-    discord_mod.app_commands.Choice = getattr(
-        discord_mod.app_commands,
-        "Choice",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
+    discord_mod.app_commands.describe = lambda **kwargs: (lambda fn: fn)
+    discord_mod.app_commands.choices = lambda **kwargs: (lambda fn: fn)
+    discord_mod.app_commands.autocomplete = lambda **kwargs: (lambda fn: fn)
+    discord_mod.app_commands.Choice = lambda **kwargs: SimpleNamespace(**kwargs)
 
     ext_mod = MagicMock()
     commands_mod = MagicMock()
@@ -103,6 +100,23 @@ async def test_registers_native_thread_slash_command(adapter):
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
+
+
+@pytest.mark.asyncio
+async def test_registers_native_steer_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["steer"]
+    interaction = SimpleNamespace()
+
+    await command(interaction, target="0", message="focus on tests")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/steer 0 focus on tests",
+        "Steer requested~",
+    )
 
 
 @pytest.mark.asyncio

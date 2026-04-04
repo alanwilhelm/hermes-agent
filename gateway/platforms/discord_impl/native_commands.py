@@ -492,14 +492,14 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
         ),
         DiscordNativeCommandSpec(
             "steer",
-            "Steer a running sub-agent",
+            "Steer the main agent (`0`) or a running sub-agent",
             "simple",
             lambda target="", message="": _join_command("/steer", target, message),
             args=(
                 DiscordArgSpec(
                     "target",
-                    "Target sub-agent id or ordinal",
-                    default="",
+                    "Target `0` for the main agent, or a sub-agent id / ordinal",
+                    default="0",
                 ),
                 DiscordArgSpec(
                     "message",
@@ -507,6 +507,7 @@ def get_command_specs() -> tuple[DiscordNativeCommandSpec, ...]:
                     default="",
                 ),
             ),
+            followup_msg="Steer requested~",
         ),
         DiscordNativeCommandSpec(
             "tell",

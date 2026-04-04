@@ -202,7 +202,8 @@ async def test_commands_command_returns_gateway_catalog():
 
     assert "Hermes Command Catalog" in result
     assert "/commands" in result
-    assert "/whoami" in result
+    assert "Use `/help` for the guided overview." in result
+    assert "/new" in result
 
 
 @pytest.mark.asyncio

@@ -105,8 +105,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "kill", "log", "info", "send", "steer", "spawn")),
     CommandDef("kill", "Abort a running sub-agent for this session", "Session",
                gateway_only=True, args_hint="<id|#|all>"),
-    CommandDef("steer", "Steer a running sub-agent immediately", "Session",
-               gateway_only=True, aliases=("tell",), args_hint="<id|#> <message>"),
+    CommandDef("steer", "Steer the running main agent (`0`) or a sub-agent immediately", "Session",
+               gateway_only=True, aliases=("tell",), args_hint="<0|id|#> <message>"),
 
     # Configuration
     CommandDef("config", "Show or update Hermes configuration", "Configuration",

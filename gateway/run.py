@@ -3182,6 +3182,50 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    @staticmethod
+    def _is_main_agent_steer_target(target: str) -> bool:
+        normalized = str(target or "").strip().lower()
+        return normalized in {"0", "#0", "main", "agent", "current"}
+
+    @staticmethod
+    def _build_followup_event(event: MessageEvent, text: str) -> MessageEvent:
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            message_id=event.message_id,
+            metadata=dict(getattr(event, "metadata", {}) or {}),
+        )
+
+    def _queue_busy_followup(
+        self,
+        *,
+        adapter: Any,
+        session_key: str,
+        event: MessageEvent,
+        text_override: Optional[str] = None,
+    ) -> None:
+        queued_event = (
+            self._build_followup_event(event, text_override)
+            if text_override is not None
+            else event
+        )
+        existing = getattr(adapter, "_pending_messages", {}).get(session_key)
+        if (
+            existing
+            and getattr(existing, "message_type", None) == MessageType.TEXT
+            and queued_event.message_type == MessageType.TEXT
+            and not existing.get_command()
+            and not queued_event.get_command()
+        ):
+            if queued_event.text:
+                if not existing.text:
+                    existing.text = queued_event.text
+                elif queued_event.text not in existing.text:
+                    existing.text = f"{existing.text}\n\n{queued_event.text}".strip()
+            return
+        adapter._pending_messages[session_key] = queued_event
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -3414,15 +3458,12 @@ class GatewayRunner:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
-
-                    queued_event = _ME(
-                        text=queued_text,
-                        message_type=_MT.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
+                    self._queue_busy_followup(
+                        adapter=adapter,
+                        session_key=_quick_key,
+                        event=event,
+                        text_override=queued_text,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
                 return "Queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -3430,6 +3471,19 @@ class GatewayRunner:
                 return "Agent is running — wait or /stop first, then switch models."
             if command_name in self._control_commands_during_run():
                 pass
+            elif source.platform == Platform.DISCORD and event.message_type == MessageType.TEXT:
+                logger.debug(
+                    "PRIORITY queue for Discord follow-up in session %s",
+                    _quick_key[:20],
+                )
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    self._queue_busy_followup(
+                        adapter=adapter,
+                        session_key=_quick_key,
+                        event=event,
+                    )
+                return None
             elif event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
                 adapter = self.adapters.get(source.platform)
@@ -5414,8 +5468,43 @@ class GatewayRunner:
         session_key = session_entry.session_key
         parts = self._split_command_args(event.get_command_args().strip(), max_parts=2)
         if len(parts) < 2:
-            return "Usage: `/steer <id|#> <message>`"
+            return "Usage: `/steer <0|id|#> <message>`"
         target, message = parts
+        if self._is_main_agent_steer_target(target):
+            running_agent = self._running_agents.get(session_key)
+            if running_agent is None:
+                return "No running main agent found for this session."
+
+            adapter = self.adapters.get(event.source.platform)
+            if adapter and hasattr(adapter, "_pending_messages"):
+                self._queue_busy_followup(
+                    adapter=adapter,
+                    session_key=session_key,
+                    event=event,
+                    text_override=message,
+                )
+                active_session = getattr(adapter, "_active_sessions", {}).get(session_key)
+                if active_session is not None:
+                    active_session.set()
+
+            if running_agent is not _AGENT_PENDING_SENTINEL and hasattr(running_agent, "interrupt"):
+                try:
+                    running_agent.interrupt(message)
+                except Exception as exc:
+                    logger.debug("Main-agent steer failed for session %s: %s", session_key, exc)
+
+            if running_agent is _AGENT_PENDING_SENTINEL:
+                return (
+                    "↪ Steering the main agent as soon as it finishes starting.\n\n"
+                    f"**Next goal:** {message}"
+                )
+
+            return (
+                "↪ Steering the main agent.\n\n"
+                f"**Next goal:** {message}\n"
+                "The current run will stop and restart on the steer message."
+            )
+
         targets, error = self._resolve_subagent_targets(session_key, target, active_only=True)
         if error:
             return error
@@ -5878,7 +5967,9 @@ class GatewayRunner:
         page_entries = entries[start:start + page_size]
 
         lines = [
-            f"📚 **Hermes Command Catalog** ({len(entries)} total, page {page}/{total_pages})",
+            f"🧭 **Hermes Command Catalog** ({len(entries)} total, page {page}/{total_pages})",
+            "",
+            "Use `/help` for the guided overview.",
             "",
             *page_entries,
         ]

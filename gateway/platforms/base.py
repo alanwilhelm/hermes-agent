@@ -1138,55 +1138,39 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-        
+
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
-            # Certain commands must bypass the active-session guard and be
-            # dispatched directly to the gateway runner.  Without this, they
-            # are queued as pending messages and either:
-            #   - leak into the conversation as user text (/stop, /new), or
-            #   - deadlock (/approve, /deny — agent is blocked on Event.wait)
-            #
-            # Dispatch inline: call the message handler directly and send the
-            # response.  Do NOT use _process_message_background — it manages
-            # session lifecycle and its cleanup races with the running task
-            # (see PR #4926).
-            cmd = event.get_command()
-            if cmd in ("approve", "deny", "status", "stop", "new", "reset"):
+            active_command = self._active_session_command_name(event)
+            if active_command in {"approve", "deny", "status", "stop", "new", "queue", "steer"}:
                 logger.debug(
-                    "[%s] Command '/%s' bypassing active-session guard for %s",
-                    self.name, cmd, session_key,
+                    "[%s] Dispatching active-session command %s for %s",
+                    self.name,
+                    active_command,
+                    session_key,
                 )
+                task = asyncio.create_task(self._dispatch_active_session_command(event))
                 try:
-                    _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-                    response = await self._message_handler(event)
-                    if response:
-                        await self._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=response,
-                            reply_to=event.message_id,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                    self._background_tasks.add(task)
+                except TypeError:
+                    return
+                if hasattr(task, "add_done_callback"):
+                    task.add_done_callback(self._background_tasks.discard)
                 return
 
-            # Special case: photo bursts/albums frequently arrive as multiple near-
-            # simultaneous messages. Queue them without interrupting the active run,
-            # then process them immediately after the current task finishes.
-            if event.message_type == MessageType.PHOTO:
-                logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                existing = self._pending_messages.get(session_key)
-                if existing and existing.message_type == MessageType.PHOTO:
-                    existing.media_urls.extend(event.media_urls)
-                    existing.media_types.extend(event.media_types)
-                    if event.text:
-                        existing.text = self._merge_caption(existing.text, event.text)
-                else:
-                    self._pending_messages[session_key] = event
-                return  # Don't interrupt now - will run after current task completes
+            # Special cases: photo bursts and Discord text follow-ups should queue
+            # quietly for the next turn instead of interrupting the current run.
+            if self._should_queue_followup_without_interrupt(event):
+                logger.debug(
+                    "[%s] Queuing follow-up for session %s without interrupt",
+                    self.name,
+                    session_key,
+                )
+                self._store_pending_followup(session_key, event)
+                return
 
-            # Default behavior for non-photo follow-ups: interrupt the running agent
+            # Default behavior for non-photo/non-queued follow-ups: interrupt the
+            # running agent so the new message can take over immediately.
             logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
             self._pending_messages[session_key] = event
             # Signal the interrupt (the processing task checks this)
@@ -1210,6 +1194,81 @@ class BasePlatformAdapter(ABC):
             return
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+
+    def _active_session_command_name(self, event: MessageEvent) -> Optional[str]:
+        command = event.get_command()
+        if not command:
+            return None
+        try:
+            from hermes_cli.commands import resolve_command
+
+            cmd_def = resolve_command(command)
+            if cmd_def:
+                return cmd_def.name
+        except Exception:
+            pass
+        return command
+
+    def _should_queue_followup_without_interrupt(self, event: MessageEvent) -> bool:
+        if event.message_type == MessageType.PHOTO:
+            return True
+        return (
+            self.platform == Platform.DISCORD
+            and event.message_type == MessageType.TEXT
+            and not event.get_command()
+        )
+
+    def _store_pending_followup(self, session_key: str, event: MessageEvent) -> None:
+        existing = self._pending_messages.get(session_key)
+        if (
+            existing
+            and existing.message_type == MessageType.PHOTO
+            and event.message_type == MessageType.PHOTO
+        ):
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+            return
+
+        if (
+            existing
+            and existing.message_type == MessageType.TEXT
+            and event.message_type == MessageType.TEXT
+            and not existing.get_command()
+            and not event.get_command()
+            and self.platform == Platform.DISCORD
+        ):
+            if event.text:
+                if not existing.text:
+                    existing.text = event.text
+                elif event.text not in existing.text:
+                    existing.text = f"{existing.text}\n\n{event.text}".strip()
+            return
+
+        self._pending_messages[session_key] = event
+
+    async def _dispatch_active_session_command(self, event: MessageEvent) -> None:
+        """Run a control command while another turn is still active."""
+        if not self._message_handler:
+            return
+
+        try:
+            response = await self._message_handler(event)
+        except Exception as exc:
+            logger.error("[%s] Active-session command failed: %s", self.name, exc, exc_info=True)
+            response = f"Sorry, I couldn't process `{event.text}` right now.\n{type(exc).__name__}: {exc}"
+
+        if not response:
+            return
+
+        thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        await self._send_with_retry(
+            chat_id=event.source.chat_id,
+            content=response,
+            reply_to=event.message_id,
+            metadata=thread_metadata,
+        )
     
     @staticmethod
     def _get_human_delay() -> float:
