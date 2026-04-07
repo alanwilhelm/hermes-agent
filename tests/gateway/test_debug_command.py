@@ -51,6 +51,17 @@ from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clear_discord_policy_env(monkeypatch):
+    for key in (
+        "DISCORD_REQUIRE_MENTION",
+        "DISCORD_AUTO_THREAD",
+        "DISCORD_ALLOW_BOTS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def _make_event(text="/debug") -> MessageEvent:
     source = SessionSource(
         platform=Platform.DISCORD,

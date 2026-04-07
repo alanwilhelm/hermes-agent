@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from gateway.platforms.discord_impl import config as discord_config
+from gateway.platforms.discord_impl import command_sessions as discord_command_sessions
 from gateway.platforms.discord_impl import delivery as discord_delivery
 from gateway.platforms.discord_impl import history as discord_history
 from gateway.platforms.discord_impl import intake as discord_intake
@@ -1866,44 +1867,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
-        is_dm = isinstance(interaction.channel, discord.DMChannel)
-        is_thread = isinstance(interaction.channel, discord.Thread)
-        thread_id = None
-
-        if is_dm:
-            chat_type = "dm"
-        elif is_thread:
-            chat_type = "thread"
-            thread_id = str(interaction.channel_id)
-        else:
-            chat_type = "group"
-
-        chat_name = ""
-        if not is_dm and hasattr(interaction.channel, "name"):
-            chat_name = interaction.channel.name
-            if hasattr(interaction.channel, "guild") and interaction.channel.guild:
-                chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
-
-        # Get channel topic (if available)
-        chat_topic = getattr(interaction.channel, "topic", None)
-
-        source = self.build_source(
-            chat_id=str(interaction.channel_id),
-            chat_name=chat_name,
-            chat_type=chat_type,
-            user_id=str(interaction.user.id),
-            user_name=interaction.user.display_name,
-            thread_id=thread_id,
-            chat_topic=chat_topic,
-        )
-
-        msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
-        return MessageEvent(
-            text=text,
-            message_type=msg_type,
-            source=source,
-            raw_message=interaction,
-        )
+        return discord_command_sessions.build_slash_event(self, interaction, text)
 
     # ------------------------------------------------------------------
     # Thread creation helpers
@@ -2613,6 +2577,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
 if DISCORD_AVAILABLE:
 
+    _DISCORD_BUTTON_STYLE_SECONDARY = getattr(
+        discord.ButtonStyle,
+        "grey",
+        getattr(discord.ButtonStyle, "gray", discord.ButtonStyle.blurple),
+    )
+
     class ExecApprovalView(discord.ui.View):
         """
         Interactive button view for exec approval of dangerous commands.
@@ -2683,7 +2653,7 @@ if DISCORD_AVAILABLE:
         ):
             await self._resolve(interaction, "once", discord.Color.green(), "Approved once")
 
-        @discord.ui.button(label="Allow Session", style=discord.ButtonStyle.grey)
+        @discord.ui.button(label="Allow Session", style=_DISCORD_BUTTON_STYLE_SECONDARY)
         async def allow_session(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
@@ -2883,7 +2853,7 @@ if DISCORD_AVAILABLE:
             self.add_item(select)
 
             back_btn = discord.ui.Button(
-                label="◀ Back", style=discord.ButtonStyle.grey, custom_id="model_back"
+                label="◀ Back", style=_DISCORD_BUTTON_STYLE_SECONDARY, custom_id="model_back"
             )
             back_btn.callback = self._on_back
             self.add_item(back_btn)

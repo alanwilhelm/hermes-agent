@@ -908,6 +908,54 @@ class GatewayRunner:
         if not hasattr(self, "_honcho_configs"):
             self._honcho_configs = {}
 
+        if session_key in self._honcho_managers:
+            return self._honcho_managers[session_key], self._honcho_configs.get(session_key)
+
+        try:
+            from honcho_integration.client import HonchoClientConfig, get_honcho_client
+            from honcho_integration.session import HonchoSessionManager
+
+            hcfg = HonchoClientConfig.from_global_config()
+            if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+                return None, hcfg
+
+            client = get_honcho_client(hcfg)
+            manager = HonchoSessionManager(
+                honcho=client,
+                config=hcfg,
+                context_tokens=hcfg.context_tokens,
+            )
+            self._honcho_managers[session_key] = manager
+            self._honcho_configs[session_key] = hcfg
+            return manager, hcfg
+        except Exception as e:
+            logger.debug("Gateway Honcho init failed for %s: %s", session_key, e)
+            return None, None
+
+    def _shutdown_gateway_honcho(self, session_key: str) -> None:
+        """Flush and close the persistent Honcho manager for a gateway session."""
+        managers = getattr(self, "_honcho_managers", None)
+        configs = getattr(self, "_honcho_configs", None)
+        if managers is None or configs is None:
+            return
+
+        manager = managers.pop(session_key, None)
+        configs.pop(session_key, None)
+        if not manager:
+            return
+        try:
+            manager.shutdown()
+        except Exception as e:
+            logger.debug("Gateway Honcho shutdown failed for %s: %s", session_key, e)
+
+    def _shutdown_all_gateway_honcho(self) -> None:
+        """Flush and close all persistent Honcho managers."""
+        managers = getattr(self, "_honcho_managers", None)
+        if not managers:
+            return
+        for session_key in list(managers.keys()):
+            self._shutdown_gateway_honcho(session_key)
+
 
 
     # -- Setup skill availability ----------------------------------------
@@ -3318,8 +3366,6 @@ class GatewayRunner:
             running_agent = self._running_agents.get(_quick_key)
             if command_name == "status":
                 return await self._handle_status_command(event)
-            if command_name == "stop" and running_agent is _AGENT_PENDING_SENTINEL:
-                return "⏳ The agent is still starting up — nothing to stop yet."
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -5840,14 +5886,14 @@ class GatewayRunner:
         if not entries:
             return "No commands available."
 
-        page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
+        page_size = 20
         total_pages = max(1, (len(entries) + page_size - 1) // page_size)
         page = max(1, min(requested_page, total_pages))
         start = (page - 1) * page_size
         page_entries = entries[start:start + page_size]
 
         lines = [
-            f"📚 **Commands** ({len(entries)} total, page {page}/{total_pages})",
+            f"📚 **Hermes Command Catalog** ({len(entries)} total, page {page}/{total_pages})",
             "",
             *page_entries,
         ]
@@ -9400,7 +9446,8 @@ class GatewayRunner:
             
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(tool_name, default="⚙️")
+            default_emoji = "💻" if tool_name == "terminal" else "⚙️"
+            emoji = get_tool_emoji(tool_name, default=default_emoji)
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
