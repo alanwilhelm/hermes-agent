@@ -777,6 +777,10 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str]]:
     endpoints where the base URL lives in config.yaml instead of the live
     environment.
     """
+    main_provider = _read_main_provider()
+    if main_provider not in {"custom"} and not main_provider.startswith("custom:"):
+        return None, None
+
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -1029,7 +1033,7 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     main_model = _read_main_model()
     if (main_provider and main_model
             and main_provider not in _AGGREGATOR_PROVIDERS
-            and main_provider not in ("auto", "custom", "")):
+            and main_provider not in ("auto", "custom", "", "openai-codex", "codex")):
         client, resolved = resolve_provider_client(main_provider, main_model)
         if client is not None:
             logger.info("Auxiliary auto-detect: using main provider %s (%s)",
