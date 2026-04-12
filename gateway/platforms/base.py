@@ -1149,13 +1149,7 @@ class BasePlatformAdapter(ABC):
                     active_command,
                     session_key,
                 )
-                task = asyncio.create_task(self._dispatch_active_session_command(event))
-                try:
-                    self._background_tasks.add(task)
-                except TypeError:
-                    return
-                if hasattr(task, "add_done_callback"):
-                    task.add_done_callback(self._background_tasks.discard)
+                await self._dispatch_active_session_command(event)
                 return
 
             # Special cases: photo bursts and Discord text follow-ups should queue
