@@ -78,6 +78,7 @@ def adapter():
         fetch_channel=AsyncMock(),
         user=SimpleNamespace(id=99999, name="HermesBot"),
     )
+    adapter._text_batch_delay_seconds = 0  # disable batching for tests
     return adapter
 
 
@@ -541,6 +542,7 @@ async def test_auto_thread_platform_extra_overrides_env(monkeypatch):
     config = PlatformConfig(enabled=True, token="fake-token", extra={"auto_thread": False})
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    adapter._text_batch_delay_seconds = 0
     adapter._auto_create_thread = AsyncMock()
 
     captured_events = []

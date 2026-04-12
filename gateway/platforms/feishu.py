@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import mimetypes
@@ -263,6 +264,7 @@ class FeishuAdapterSettings:
     bot_name: str
     dedup_cache_size: int
     text_batch_delay_seconds: float
+    text_batch_split_delay_seconds: float
     text_batch_max_messages: int
     text_batch_max_chars: int
     media_batch_delay_seconds: float
@@ -358,19 +360,21 @@ def _render_code_block_element(element: Dict[str, Any]) -> str:
 
 
 def _strip_markdown_to_plain_text(text: str) -> str:
+    """Strip markdown formatting to plain text for Feishu text fallbacks.
+
+    Delegates common markdown stripping to the shared helper and adds
+    Feishu-specific patterns (blockquotes, strikethrough, underline tags,
+    horizontal rules, \\r\\n normalisation).
+    """
+    from gateway.platforms.helpers import strip_markdown
     plain = text.replace("\r\n", "\n")
     plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
-    plain = re.sub(r"^#{1,6}\s+", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
-    plain = re.sub(r"```(?:[^\n]*\n)?([\s\S]*?)```", lambda m: m.group(1).strip("\n"), plain)
-    plain = re.sub(r"`([^`\n]+)`", r"\1", plain)
-    plain = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", plain)
-    plain = re.sub(r"\*([^*\n]+)\*", r"\1", plain)
     plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
     plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
-    plain = re.sub(r"\n{3,}", "\n\n", plain)
-    return plain.strip()
+    plain = strip_markdown(plain)
+    return plain
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -971,7 +975,8 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         return await original_connect(*args, **kwargs)
 
     def _configure_with_overrides(conf: Any) -> Any:
-        assert original_configure is not None
+        if original_configure is None:
+            raise RuntimeError("Feishu _configure_with_overrides called but original_configure is None")
         result = original_configure(conf)
         _apply_runtime_ws_overrides()
         return result
@@ -1013,6 +1018,10 @@ class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
     MAX_MESSAGE_LENGTH = 8000
+    # Threshold for detecting Feishu client-side message splits.
+    # When a chunk is near the ~4096-char practical limit, a continuation
+    # is almost certain.
+    _SPLIT_THRESHOLD = 4000
 
     # =========================================================================
     # Lifecycle — init / settings / connect / disconnect
@@ -1052,6 +1061,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
+        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
+        self._approval_state: Dict[int, Dict[str, str]] = {}
+        self._approval_counter = itertools.count(1)
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1101,6 +1113,9 @@ class FeishuAdapter(BasePlatformAdapter):
             text_batch_delay_seconds=float(
                 os.getenv("HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS", str(_DEFAULT_TEXT_BATCH_DELAY_SECONDS))
             ),
+            text_batch_split_delay_seconds=float(
+                os.getenv("HERMES_FEISHU_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0")
+            ),
             text_batch_max_messages=max(
                 1,
                 int(os.getenv("HERMES_FEISHU_TEXT_BATCH_MAX_MESSAGES", str(_DEFAULT_TEXT_BATCH_MAX_MESSAGES))),
@@ -1148,6 +1163,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_name = settings.bot_name
         self._dedup_cache_size = settings.dedup_cache_size
         self._text_batch_delay_seconds = settings.text_batch_delay_seconds
+        self._text_batch_split_delay_seconds = settings.text_batch_split_delay_seconds
         self._text_batch_max_messages = settings.text_batch_max_messages
         self._text_batch_max_chars = settings.text_batch_max_chars
         self._media_batch_delay_seconds = settings.media_batch_delay_seconds
@@ -1176,6 +1192,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
             )
             .register_p2_card_action_trigger(self._on_card_action_trigger)
+            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+            .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .build()
         )
 
@@ -1394,6 +1412,104 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def send_exec_approval(
+        self, chat_id: str, command: str, session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive card with approval buttons.
+
+        The buttons carry ``hermes_action`` in their value dict so that
+        ``_handle_card_action_event`` can intercept them and call
+        ``resolve_gateway_approval()`` to unblock the waiting agent thread.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            approval_id = next(self._approval_counter)
+            cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
+
+            def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
+                return {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": btn_type,
+                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                }
+
+            card = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
+                    "template": "orange",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                    },
+                    {
+                        "tag": "action",
+                        "actions": [
+                            _btn("✅ Allow Once", "approve_once", "primary"),
+                            _btn("✅ Session", "approve_session"),
+                            _btn("✅ Always", "approve_always"),
+                            _btn("❌ Deny", "deny", "danger"),
+                        ],
+                    },
+                ],
+            }
+
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+
+            result = self._finalize_send_result(response, "send_exec_approval failed")
+            if result.success:
+                self._approval_state[approval_id] = {
+                    "session_key": session_key,
+                    "message_id": result.message_id or "",
+                    "chat_id": chat_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_exec_approval failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_approval_card(
+        self, message_id: str, label: str, user_name: str, choice: str,
+    ) -> None:
+        """Replace the approval card with a resolved status card."""
+        if not self._client or not message_id:
+            return
+        icon = "❌" if choice == "deny" else "✅"
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"{icon} {label}", "tag": "plain_text"},
+                "template": "red" if choice == "deny" else "green",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"{icon} **{label}** by {user_name}",
+                },
+            ],
+        }
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            body = self._build_update_message_body(msg_type="interactive", content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=body)
+            await asyncio.to_thread(self._client.im.v1.message.update, request)
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
+
     async def send_voice(
         self,
         chat_id: str,
@@ -1468,13 +1584,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
 
         try:
-            with open(image_path, "rb") as image_file:
-                body = self._build_image_upload_body(
-                    image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
-                    image=image_file,
-                )
-                request = self._build_image_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            import io as _io
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            # Wrap in BytesIO so lark SDK's MultipartEncoder can read .name and .tell()
+            image_file = _io.BytesIO(image_bytes)
+            image_file.name = os.path.basename(image_path)
+            body = self._build_image_upload_body(
+                image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
+                image=image_file,
+            )
+            request = self._build_image_upload_request(body)
+            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(
@@ -1820,6 +1941,52 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_tag = str(getattr(action, "tag", "") or "button")
         action_value = getattr(action, "value", {}) or {}
+
+        # --- Exec approval button intercept ---
+        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        if hermes_action:
+            approval_id = action_value.get("approval_id")
+            state = self._approval_state.pop(approval_id, None)
+            if not state:
+                logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
+                return
+
+            choice_map = {
+                "approve_once": "once",
+                "approve_session": "session",
+                "approve_always": "always",
+                "deny": "deny",
+            }
+            choice = choice_map.get(hermes_action, "deny")
+
+            label_map = {
+                "once": "Approved once",
+                "session": "Approved for session",
+                "always": "Approved permanently",
+                "deny": "Denied",
+            }
+            label = label_map.get(choice, "Resolved")
+
+            # Resolve sender name for the status card
+            sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+            sender_profile = await self._resolve_sender_profile(sender_id)
+            user_name = sender_profile.get("user_name") or open_id
+
+            # Resolve the approval — unblocks the agent thread
+            try:
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(state["session_key"], choice)
+                logger.info(
+                    "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, state["session_key"], choice, user_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+
+            # Update the card to show the decision
+            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
+            return
+
         synthetic_text = f"/card {action_tag}"
         if action_value:
             try:
@@ -2109,6 +2276,10 @@ class FeishuAdapter(BasePlatformAdapter):
         default_ext: str,
         preferred_name: str,
     ) -> tuple[str, str]:
+        from tools.url_safety import is_safe_url
+        if not is_safe_url(file_url):
+            raise ValueError(f"Blocked unsafe URL (SSRF protection): {file_url[:80]}")
+
         import httpx
 
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -2326,8 +2497,10 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Debounce rapid Feishu text bursts into a single MessageEvent."""
         key = self._text_batch_key(event)
+        chunk_len = len(event.text or "")
         existing = self._pending_text_batches.get(key)
         if existing is None:
+            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
             self._pending_text_batch_counts[key] = 1
             self._schedule_text_batch_flush(key)
@@ -2352,6 +2525,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         existing.text = next_text
+        existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
             existing.message_id = event.message_id
@@ -2378,10 +2552,22 @@ class FeishuAdapter(BasePlatformAdapter):
         task_map[key] = asyncio.create_task(flush_fn(key))
 
     async def _flush_text_batch(self, key: str) -> None:
-        """Flush a pending text batch after the quiet period."""
+        """Flush a pending text batch after the quiet period.
+
+        Uses a longer delay when the latest chunk is near Feishu's ~4096-char
+        split point, since a continuation chunk is almost certain.
+        """
         current_task = asyncio.current_task()
         try:
-            await asyncio.sleep(self._text_batch_delay_seconds)
+            # Adaptive delay: if the latest chunk is near the split threshold,
+            # a continuation is almost certain — wait longer.
+            pending = self._pending_text_batches.get(key)
+            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+            if last_len >= self._SPLIT_THRESHOLD:
+                delay = self._text_batch_split_delay_seconds
+            else:
+                delay = self._text_batch_delay_seconds
+            await asyncio.sleep(delay)
             await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:

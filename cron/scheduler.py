@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
-    "wecom", "sms", "email", "webhook",
+    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
 })
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
@@ -91,7 +91,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             }
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in ("matrix", "telegram", "discord", "slack"):
+        for platform_name in ("matrix", "telegram", "discord", "slack", "bluebubbles"):
             chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
             if chat_id:
                 logger.info(
@@ -196,7 +196,7 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target (origin chat, specific platform, etc.).
 
@@ -204,16 +204,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    Returns None on success, or an error string on failure.
     """
     target = _resolve_delivery_target(job)
     if not target:
         if job.get("deliver", "local") != "local":
-            logger.warning(
-                "Job '%s' deliver=%s but no concrete delivery target could be resolved",
-                job["id"],
-                job.get("deliver", "local"),
-            )
-        return
+            msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            return msg
+        return None  # local-only jobs don't deliver — not a failure
 
     platform_name = target["platform"]
     chat_id = target["chat_id"]
@@ -234,24 +234,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
         "dingtalk": Platform.DINGTALK,
         "feishu": Platform.FEISHU,
         "wecom": Platform.WECOM,
+        "wecom_callback": Platform.WECOM_CALLBACK,
+        "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "bluebubbles": Platform.BLUEBUBBLES,
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
-        logger.warning("Job '%s': unknown platform '%s' for delivery", job["id"], platform_name)
-        return
+        msg = f"unknown platform '{platform_name}'"
+        logger.warning("Job '%s': %s", job["id"], msg)
+        return msg
 
     try:
         config = load_gateway_config()
     except Exception as e:
-        logger.error("Job '%s': failed to load gateway config for delivery: %s", job["id"], e)
-        return
+        msg = f"failed to load gateway config: {e}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
 
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
-        logger.warning("Job '%s': platform '%s' not configured/enabled", job["id"], platform_name)
-        return
+        msg = f"platform '{platform_name}' not configured/enabled"
+        logger.warning("Job '%s': %s", job["id"], msg)
+        return msg
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
@@ -307,7 +313,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
 
             if adapter_ok:
                 logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
-                return
+                return None
         except Exception as e:
             logger.warning(
                 "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
@@ -329,16 +335,55 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> None:
             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
             result = future.result(timeout=30)
     except Exception as e:
-        logger.error("Job '%s': delivery to %s:%s failed: %s", job["id"], platform_name, chat_id, e)
-        return
+        msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
 
     if result and result.get("error"):
-        logger.error("Job '%s': delivery error: %s", job["id"], result["error"])
-    else:
-        logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+        msg = f"delivery error: {result['error']}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+
+    logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+    return None
 
 
-_SCRIPT_TIMEOUT = 120  # seconds
+_DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
+# Backward-compatible module override used by tests and emergency monkeypatches.
+_SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+
+
+def _get_script_timeout() -> int:
+    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+    if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
+        try:
+            timeout = int(float(_SCRIPT_TIMEOUT))
+            if timeout > 0:
+                return timeout
+        except Exception:
+            logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
+
+    env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
+    if env_value:
+        try:
+            timeout = int(float(env_value))
+            if timeout > 0:
+                return timeout
+        except Exception:
+            logger.warning("Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value)
+
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        configured = cron_cfg.get("script_timeout_seconds")
+        if configured is not None:
+            timeout = int(float(configured))
+            if timeout > 0:
+                return timeout
+    except Exception as exc:
+        logger.debug("Failed to load cron script timeout from config: %s", exc)
+
+    return _DEFAULT_SCRIPT_TIMEOUT
 
 
 def _run_job_script(script_path: str) -> tuple[bool, str]:
@@ -385,16 +430,26 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    script_timeout = _get_script_timeout()
+
     try:
         result = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True,
             text=True,
-            timeout=_SCRIPT_TIMEOUT,
+            timeout=script_timeout,
             cwd=str(path.parent),
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
+
+        # Redact secrets from both stdout and stderr before any return path.
+        try:
+            from agent.redact import redact_sensitive_text
+            stdout = redact_sensitive_text(stdout)
+            stderr = redact_sensitive_text(stderr)
+        except Exception:
+            pass
 
         if result.returncode != 0:
             parts = [f"Script exited with code {result.returncode}"]
@@ -404,17 +459,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 parts.append(f"stdout:\n{stdout}")
             return False, "\n".join(parts)
 
-        # Redact any secrets that may appear in script output before
-        # they are injected into the LLM prompt context.
-        try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-        except Exception:
-            pass
         return True, stdout
 
     except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {_SCRIPT_TIMEOUT}s: {path}"
+        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
@@ -578,11 +626,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
-        # Reasoning config from env or config.yaml
+        # Reasoning config from config.yaml
         from hermes_constants import parse_reasoning_effort
-        effort = os.getenv("HERMES_REASONING_EFFORT", "")
-        if not effort:
-            effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
         reasoning_config = parse_reasoning_effort(effort)
 
         # Prefill messages from env or config.yaml
@@ -640,6 +686,24 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             },
         )
 
+        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        credential_pool = None
+        runtime_provider = str(turn_route["runtime"].get("provider") or "").strip().lower()
+        if runtime_provider:
+            try:
+                from agent.credential_pool import load_pool
+                pool = load_pool(runtime_provider)
+                if pool.has_credentials():
+                    credential_pool = pool
+                    logger.info(
+                        "Job '%s': loaded credential pool for provider %s with %d entries",
+                        job_id,
+                        runtime_provider,
+                        len(pool.entries()),
+                    )
+            except Exception as e:
+                logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+
         agent = AIAgent(
             model=turn_route["model"],
             api_key=turn_route["runtime"].get("api_key"),
@@ -651,12 +715,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
+            fallback_model=fallback_model,
+            credential_pool=credential_pool,
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
+            skip_context_files=True,  # Don't inject SOUL.md/AGENTS.md from scheduler cwd
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,
@@ -705,7 +772,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
-            _cron_pool.shutdown(wait=False)
+            _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -868,13 +935,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
+                delivery_error = None
                 if should_deliver:
                     try:
-                        _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                     except Exception as de:
+                        delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
-                mark_job_run(job["id"], success, error)
+                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 executed += 1
 
             except Exception as e:

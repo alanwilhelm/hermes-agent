@@ -1253,7 +1253,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             for block in (result.content or []):
                 if hasattr(block, "text"):
                     parts.append(block.text)
-            return json.dumps({"result": "\n".join(parts) if parts else ""})
+            text_result = "\n".join(parts) if parts else ""
+
+            # Combine content + structuredContent when both are present.
+            # MCP spec: content is model-oriented (text), structuredContent
+            # is machine-oriented (JSON metadata).  For an AI agent, content
+            # is the primary payload; structuredContent supplements it.
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                if text_result:
+                    return json.dumps({
+                        "result": text_result,
+                        "structuredContent": structured,
+                    })
+                return json.dumps({"result": structured})
+            return json.dumps({"result": text_result})
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
@@ -1317,6 +1331,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1406,6 +1422,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -2142,6 +2160,7 @@ def _kill_orphaned_mcp_children() -> None:
     Only kills PIDs tracked in ``_stdio_pids`` — never arbitrary children.
     """
     import signal as _signal
+    kill_signal = getattr(_signal, "SIGKILL", _signal.SIGTERM)
 
     with _lock:
         pids = list(_stdio_pids)
@@ -2149,7 +2168,7 @@ def _kill_orphaned_mcp_children() -> None:
 
     for pid in pids:
         try:
-            os.kill(pid, _signal.SIGKILL)
+            os.kill(pid, kill_signal)
             logger.debug("Force-killed orphaned MCP stdio process %d", pid)
         except (ProcessLookupError, PermissionError, OSError):
             pass  # Already exited or inaccessible

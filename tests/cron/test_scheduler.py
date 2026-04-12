@@ -173,6 +173,40 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_discord_topic_target_with_thread_id(self):
+        """deliver: 'discord:chat_id:thread_id' parses correctly."""
+        job = {
+            "deliver": "discord:-1001234567890:17585",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "discord",
+            "chat_id": "-1001234567890",
+            "thread_id": "17585",
+        }
+
+    def test_explicit_discord_chat_id_without_thread_id(self):
+        """deliver: 'discord:chat_id' sets thread_id to None."""
+        job = {
+            "deliver": "discord:9876543210",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "discord",
+            "chat_id": "9876543210",
+            "thread_id": None,
+        }
+
+    def test_explicit_discord_channel_without_thread(self):
+        """deliver: 'discord:1001234567890' resolves via explicit platform:chat_id path."""
+        job = {
+            "deliver": "discord:1001234567890",
+        }
+        result = _resolve_delivery_target(job)
+        assert result == {
+            "platform": "discord",
+            "chat_id": "1001234567890",
+            "thread_id": None,
+        }
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -506,6 +540,90 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
+
+
+class TestDeliverResultErrorReturns:
+    """Verify _deliver_result returns error strings on failure, None on success."""
+
+    def test_returns_none_on_successful_delivery(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})):
+            job = {
+                "id": "ok-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            result = _deliver_result(job, "Output.")
+        assert result is None
+
+    def test_returns_none_for_local_delivery(self):
+        """local-only jobs don't deliver — not a failure."""
+        job = {"id": "local-job", "deliver": "local"}
+        result = _deliver_result(job, "Output.")
+        assert result is None
+
+    def test_returns_error_for_unknown_platform(self):
+        job = {
+            "id": "bad-platform",
+            "deliver": "origin",
+            "origin": {"platform": "fax", "chat_id": "123"},
+        }
+        with patch("gateway.config.load_gateway_config"):
+            result = _deliver_result(job, "Output.")
+        assert result is not None
+        assert "unknown platform" in result
+
+    def test_returns_error_when_platform_disabled(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = False
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg):
+            job = {
+                "id": "disabled",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            result = _deliver_result(job, "Output.")
+        assert result is not None
+        assert "not configured" in result
+
+    def test_returns_error_on_send_failure(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "rate limited"})):
+            job = {
+                "id": "rate-limited",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            result = _deliver_result(job, "Output.")
+        assert result is not None
+        assert "rate limited" in result
+
+    def test_returns_error_for_unresolved_target(self, monkeypatch):
+        """Non-local delivery with no resolvable target should return an error."""
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        job = {"id": "no-target", "deliver": "telegram"}
+        result = _deliver_result(job, "Output.")
+        assert result is not None
+        assert "no delivery target" in result
 
 
 class TestRunJobSessionPersistence:
