@@ -151,6 +151,18 @@ try:
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
+# Apply IPv4 preference early, before any HTTP clients are created.
+try:
+    from hermes_cli.config import load_config as _load_config_early
+    from hermes_constants import apply_ipv4_preference as _apply_ipv4
+    _early_cfg = _load_config_early()
+    _net = _early_cfg.get("network", {})
+    if isinstance(_net, dict) and _net.get("force_ipv4"):
+        _apply_ipv4(force=True)
+    del _early_cfg, _net
+except Exception:
+    pass  # best-effort — don't crash if config isn't available yet
+
 import logging
 import time as _time
 from datetime import datetime
@@ -1095,6 +1107,7 @@ def select_provider_and_model(args=None):
                 "base_url": base_url,
                 "api_key": entry.get("api_key", ""),
                 "model": entry.get("model", ""),
+                "api_mode": entry.get("api_mode", ""),
             }
         return custom_provider_map
 
@@ -1943,6 +1956,12 @@ def _model_flow_named_custom(config, provider_info):
     model["base_url"] = base_url
     if api_key:
         model["api_key"] = api_key
+    # Apply api_mode from custom_providers entry, or clear stale value
+    custom_api_mode = provider_info.get("api_mode", "")
+    if custom_api_mode:
+        model["api_mode"] = custom_api_mode
+    else:
+        model.pop("api_mode", None)  # let runtime auto-detect from URL
     save_config(cfg)
     deactivate_provider()
 
@@ -2480,8 +2499,11 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         print()
         override = ""
     if override and base_url_env:
-        save_env_value(base_url_env, override)
-        effective_base = override
+        if not override.startswith(("http://", "https://")):
+            print("  Invalid URL — must start with http:// or https://. Keeping current value.")
+        else:
+            save_env_value(base_url_env, override)
+            effective_base = override
 
     # Model selection — resolution order:
     #   1. models.dev registry (cached, filtered for agentic/tool-capable models)
@@ -3917,6 +3939,26 @@ def cmd_update(args):
         print()
         print("✓ Update complete!")
         
+        # Write exit code *before* the gateway restart attempt.
+        # When running as ``hermes update --gateway`` (spawned by the gateway's
+        # /update command), this process lives inside the gateway's systemd
+        # cgroup.  ``systemctl restart hermes-gateway`` kills everything in the
+        # cgroup (KillMode=mixed → SIGKILL to remaining processes), including
+        # us and the wrapping bash shell.  The shell never reaches its
+        # ``printf $status > .update_exit_code`` epilogue, so the exit-code
+        # marker file is never created.  The new gateway's update watcher then
+        # polls for 30 minutes and sends a spurious timeout message.
+        #
+        # Writing the marker here — after git pull + pip install succeed but
+        # before we attempt the restart — ensures the new gateway sees it
+        # regardless of how we die.
+        if gateway_mode:
+            _exit_code_path = get_hermes_home() / ".update_exit_code"
+            try:
+                _exit_code_path.write_text("0")
+            except OSError:
+                pass
+        
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
         # running gateway needs restarting to pick up the new code.
@@ -4201,18 +4243,24 @@ def cmd_profile(args):
                             print(f'  Add to your shell config (~/.bashrc or ~/.zshrc):')
                             print(f'    export PATH="$HOME/.local/bin:$PATH"')
 
+            # Profile dir for display
+            try:
+                profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+            except ValueError:
+                profile_dir_display = str(profile_dir)
+
             # Next steps
             print(f"\nNext steps:")
             print(f"  {name} setup              Configure API keys and model")
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
             if clone or clone_all:
-                try:
-                    profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
-                except ValueError:
-                    profile_dir_display = str(profile_dir)
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
+            else:
+                print(f"\n  ⚠ This profile has no API keys yet. Run '{name} setup' first,")
+                print(f"    or it will inherit keys from your shell environment.")
+                print(f"  Edit {profile_dir_display}/SOUL.md to customize personality")
             print()
 
         except (ValueError, FileExistsError, FileNotFoundError) as e:

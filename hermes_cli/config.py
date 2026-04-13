@@ -50,6 +50,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD",
+    "MATRIX_RECOVERY_KEY",
 })
 import yaml
 
@@ -147,25 +148,6 @@ def managed_error(action: str = "modify configuration"):
 # Container-aware CLI (NixOS container mode)
 # =============================================================================
 
-def _is_inside_container() -> bool:
-    """Detect if we're already running inside a Docker/Podman container."""
-    # Standard Docker/Podman indicators
-    if os.path.exists("/.dockerenv"):
-        return True
-    # Podman uses /run/.containerenv
-    if os.path.exists("/run/.containerenv"):
-        return True
-    # Check cgroup for container runtime evidence (works for both Docker & Podman)
-    try:
-        with open("/proc/1/cgroup", "r") as f:
-            cgroup = f.read()
-            if "docker" in cgroup or "podman" in cgroup or "/lxc/" in cgroup:
-                return True
-    except OSError:
-        pass
-    return False
-
-
 def get_container_exec_info() -> Optional[dict]:
     """Read container mode metadata from HERMES_HOME/.container-mode.
 
@@ -180,7 +162,8 @@ def get_container_exec_info() -> Optional[dict]:
     if os.environ.get("HERMES_DEV") == "1":
         return None
 
-    if _is_inside_container():
+    from hermes_constants import is_container
+    if is_container():
         return None
 
     container_mode_file = get_hermes_home() / ".container-mode"
@@ -354,6 +337,10 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
+        # Periodic "still working" notification interval (seconds).
+        # Sends a status message every N seconds so the user knows the
+        # agent hasn't died during long tasks.  0 = disable notifications.
+        "gateway_notify_interval": 600,
     },
     
     "terminal": {
@@ -704,6 +691,14 @@ DEFAULT_CONFIG = {
         "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
         "max_size_mb": 5,      # Max size per log file before rotation
         "backup_count": 3,     # Number of rotated backup files to keep
+    },
+
+    # Network settings — workarounds for connectivity issues.
+    "network": {
+        # Force IPv4 connections.  On servers with broken or unreachable IPv6,
+        # Python tries AAAA records first and hangs for the full TCP timeout
+        # before falling back to IPv4.  Set to true to skip IPv6 entirely.
+        "force_ipv4": False,
     },
 
     # Config schema version - bump this when adding new required fields
@@ -1282,6 +1277,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Matrix device ID (stable across restarts)",
         "url": None,
         "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "MATRIX_RECOVERY_KEY": {
+        "description": "Matrix recovery key for cross-signing verification after device key rotation (from Element: Settings → Security → Recovery Key)",
+        "prompt": "Matrix recovery key",
+        "url": None,
+        "password": True,
         "category": "messaging",
         "advanced": True,
     },
