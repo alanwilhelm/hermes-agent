@@ -3444,6 +3444,26 @@ class GatewayRunner:
             if task and not task.done():
                 task.cancel()
 
+        for runtime in self._get_subagent_runtime().values():
+            for entry in runtime.get("entries", {}).values():
+                child = entry.get("child")
+                if child is not None and hasattr(child, "interrupt"):
+                    try:
+                        child.interrupt("Gateway shutting down")
+                    except Exception as e:
+                        logger.debug("Failed interrupting subagent during shutdown: %s", e)
+
+        for session_id, task in list(self._get_acp_tasks().items()):
+            state = self._get_acp_session_manager().get_session(session_id)
+            if state and state.cancel_event:
+                state.cancel_event.set()
+                try:
+                    state.agent.interrupt("Gateway shutting down")
+                except Exception:
+                    logger.debug("Failed interrupting ACP session during shutdown", exc_info=True)
+            if task and not task.done():
+                task.cancel()
+
         for platform, adapter in list(self.adapters.items()):
             try:
                 await adapter.cancel_background_tasks()
@@ -3973,6 +3993,8 @@ class GatewayRunner:
             running_agent = self._running_agents.get(_quick_key)
             if command_name == "status":
                 return await self._handle_status_command(event)
+            if command_name == "stop" and running_agent is _AGENT_PENDING_SENTINEL:
+                return "⏳ The agent is still starting up — nothing to stop yet."
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -4103,8 +4125,27 @@ class GatewayRunner:
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
-                self._pending_messages[_quick_key] = event.text
-            return None
+                if running_agent is _AGENT_PENDING_SENTINEL:
+                    if command_name == "stop":
+                        if _quick_key in self._running_agents:
+                            del self._running_agents[_quick_key]
+                        logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
+                        return "⚡ Force-stopped. The agent was still starting — session unlocked."
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        adapter._pending_messages[_quick_key] = event
+                    return None
+                logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
+                running_agent.interrupt(event.text)
+                if _quick_key in self._pending_messages:
+                    self._pending_messages[_quick_key] += "\n" + event.text
+                else:
+                    self._pending_messages[_quick_key] = event.text
+                return None
+
+        rewritten_bash = self._rewrite_bash_shortcut(event.text)
+        if rewritten_bash:
+            event.text = rewritten_bash
 
         rewritten_bash = self._rewrite_bash_shortcut(event.text)
         if rewritten_bash:
@@ -5237,11 +5278,9 @@ class GatewayRunner:
                 logger.debug("Watch queue drain error: %s", e)
 
             # NOTE: Dangerous command approvals are now handled inline by the
-            # blocking gateway approval mechanism in tools/approval.py.  The agent
+            # blocking gateway approval mechanism in tools/approval.py. The agent
             # thread blocks until the user responds with /approve or /deny, so by
-            # the time we reach here the approval has already been resolved.  The
-            # old post-loop pop_pending + approval_hint code was removed in favour
-            # of the blocking approach that mirrors CLI's synchronous input().
+            # the time we reach here the approval has already been resolved.
             
             # Save the full conversation to the transcript, including tool calls.
             # This preserves the complete agent loop (tool_calls, tool results,

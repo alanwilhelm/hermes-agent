@@ -2164,6 +2164,8 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             msg = await channel.send(embed=embed, view=view)
+            if hasattr(view, "bind_message"):
+                view.bind_message(str(msg.id))
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
