@@ -207,6 +207,22 @@ class TestMemoryStorePersistence:
         store.load_from_disk()
         assert len(store.memory_entries) == 2
 
+    def test_wiki_inject_loads_as_prompt_snapshot(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "WIKI_INJECT.md").write_text(
+            "CRUCIAL INFO\n- Wikus uses the agent wiki\n§\nDIRECTORY\n- wiki/index.md maps sections",
+            encoding="utf-8",
+        )
+
+        store = MemoryStore(wiki_inject_char_limit=500)
+        store.load_from_disk()
+
+        snapshot = store.format_for_system_prompt("wiki_inject")
+        assert isinstance(snapshot, str)
+        assert "WIKI INJECT" in snapshot
+        assert "Wikus uses the agent wiki" in snapshot
+        assert "wiki/index.md maps sections" in snapshot
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):

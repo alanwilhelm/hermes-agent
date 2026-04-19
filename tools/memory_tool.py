@@ -2,13 +2,15 @@
 """
 Memory Tool Module - Persistent Curated Memory
 
-Provides bounded, file-backed memory that persists across sessions. Two stores:
+Provides bounded, file-backed memory that persists across sessions. Three stores:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
     conventions, tool quirks, things learned)
   - USER.md: what the agent knows about the user (preferences, communication style,
     expectations, workflow habits)
+  - WIKI_INJECT.md: distilled operational knowledge from the agent wiki, maintained
+    by the wiki-inject-sync cron. Read-only at runtime — not mutated by the memory tool.
 
-Both are injected into the system prompt as a frozen snapshot at session start.
+All three are injected into the system prompt as a frozen snapshot at session start.
 Mid-session writes update files on disk immediately (durable) but do NOT change
 the system prompt -- this preserves the prefix cache for the entire session.
 The snapshot refreshes on the next session start.
@@ -106,37 +108,43 @@ class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
 
-    Maintains two parallel states:
+    Maintains parallel states:
       - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
         Never mutated mid-session. Keeps prefix cache stable.
       - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
         Tool responses always reflect this live state.
+      - wiki_inject_entries: read-only runtime state, loaded from WIKI_INJECT.md for prompt injection.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+                 wiki_inject_char_limit: int = 25000):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.wiki_inject_char_limit = wiki_inject_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "wiki_inject": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from MEMORY.md, USER.md, and WIKI_INJECT.md; capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.wiki_inject_entries = self._read_file(mem_dir / "WIKI_INJECT.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.wiki_inject_entries = list(dict.fromkeys(self.wiki_inject_entries))
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", self.memory_entries),
             "user": self._render_block("user", self.user_entries),
+            "wiki_inject": self._render_block("wiki_inject", self.wiki_inject_entries),
         }
 
     @staticmethod
@@ -217,6 +225,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "wiki_inject":
+            return self.wiki_inject_char_limit
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -400,6 +410,8 @@ class MemoryStore:
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "wiki_inject":
+            header = f"WIKI INJECT (operational knowledge from wiki) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -578,7 +590,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

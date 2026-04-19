@@ -1431,6 +1431,7 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        wiki_inject_char_limit=mem_config.get("wiki_inject_char_limit", 25000),
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -4063,6 +4064,11 @@ class AIAgent:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+            # WIKI_INJECT.md — distilled operational knowledge from the agent wiki.
+            # Always injected when present (no config flag needed — file presence is opt-in).
+            wiki_block = self._memory_store.format_for_system_prompt("wiki_inject")
+            if wiki_block:
+                prompt_parts.append(wiki_block)
 
         # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
