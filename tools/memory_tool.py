@@ -116,7 +116,7 @@ class MemoryStore:
       - wiki_inject_entries: read-only runtime state, loaded from WIKI_INJECT.md for prompt injection.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+    def __init__(self, memory_char_limit: int = 10000, user_char_limit: int = 10000,
                  wiki_inject_char_limit: int = 25000):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []

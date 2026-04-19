@@ -1429,8 +1429,8 @@ class AIAgent:
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
-                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_char_limit=mem_config.get("memory_char_limit", 10000),
+                        user_char_limit=mem_config.get("user_char_limit", 10000),
                         wiki_inject_char_limit=mem_config.get("wiki_inject_char_limit", 25000),
                     )
                     self._memory_store.load_from_disk()

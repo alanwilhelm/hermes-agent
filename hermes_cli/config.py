@@ -690,8 +690,8 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "memory_char_limit": 10000,   # ~3.6k tokens — room for behavioral rules + context
+        "user_char_limit": 10000,     # ~3.6k tokens — room for full user profile
         "wiki_inject_char_limit": 25000,  # ~9k tokens — crucial facts + page summaries + directory
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
