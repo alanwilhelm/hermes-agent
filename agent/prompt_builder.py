@@ -925,6 +925,36 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+def load_org_md() -> Optional[str]:
+    """Load ORG.md from HERMES_HOME and return its content, or None.
+
+    ORG.md holds fleet-wide / org-level context that is shared across all
+    bots in a deployment — roster, cross-bot mention rules, operator
+    preferences, safety boundaries.  It is loaded independently of CWD
+    (like SOUL.md) so every session gets the shared organisational context
+    regardless of which project directory the gateway is running from.
+    """
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading ORG.md: %s", e)
+
+    org_path = get_hermes_home() / "ORG.md"
+    if not org_path.exists():
+        return None
+    try:
+        content = org_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "ORG.md")
+        content = _truncate_content(content, "ORG.md")
+        return content
+    except Exception as e:
+        logger.debug("Could not read ORG.md from %s: %s", org_path, e)
+        return None
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
@@ -1046,6 +1076,11 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
         soul_content = load_soul_md()
         if soul_content:
             sections.append(soul_content)
+
+    # ORG.md from HERMES_HOME — fleet-wide context, always loaded
+    org_content = load_org_md()
+    if org_content:
+        sections.append(org_content)
 
     if not sections:
         return ""
