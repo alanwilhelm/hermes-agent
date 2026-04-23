@@ -1511,8 +1511,11 @@ def provider_label(provider: Optional[str]) -> str:
 
 # Models that support OpenAI Priority Processing (service_tier="priority").
 # See https://openai.com/api-priority-processing/ for the canonical list.
-# Only the bare model slug is stored (no vendor prefix).
+# Keep this aligned with newer Codex-discovered GPT-5 models that advertise
+# a fast tier before the static docs/tests catch up. Only the bare model slug
+# is stored (no vendor prefix).
 _PRIORITY_PROCESSING_MODELS: frozenset[str] = frozenset({
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.2",

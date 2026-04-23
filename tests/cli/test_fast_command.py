@@ -111,12 +111,13 @@ class TestHandleFastCommand(unittest.TestCase):
 class TestPriorityProcessingModels(unittest.TestCase):
     """Verify the expanded Priority Processing model registry."""
 
-    def test_all_documented_models_supported(self):
+    def test_priority_processing_models_supported(self):
         from hermes_cli.models import model_supports_fast_mode
 
-        # All models from OpenAI's Priority Processing pricing table
+        # OpenAI Priority Processing models plus newly discovered GPT-5 models
+        # that advertise fast-tier support before the public pricing table catches up.
         supported = [
-            "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
+            "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
             "gpt-5.1", "gpt-5", "gpt-5-mini",
             "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
             "gpt-4o", "gpt-4o-mini",
@@ -128,6 +129,7 @@ class TestPriorityProcessingModels(unittest.TestCase):
     def test_vendor_prefix_stripped(self):
         from hermes_cli.models import model_supports_fast_mode
 
+        assert model_supports_fast_mode("openai/gpt-5.5") is True
         assert model_supports_fast_mode("openai/gpt-5.4") is True
         assert model_supports_fast_mode("openai/gpt-4.1") is True
         assert model_supports_fast_mode("openai/o3") is True
@@ -142,6 +144,9 @@ class TestPriorityProcessingModels(unittest.TestCase):
 
     def test_resolve_overrides_returns_service_tier(self):
         from hermes_cli.models import resolve_fast_mode_overrides
+
+        result = resolve_fast_mode_overrides("gpt-5.5")
+        assert result == {"service_tier": "priority"}
 
         result = resolve_fast_mode_overrides("gpt-5.4")
         assert result == {"service_tier": "priority"}
