@@ -89,6 +89,7 @@ def _session(agent=None, **extra):
         "session_key": "session-key",
         "history": [],
         "history_lock": threading.Lock(),
+        "runtime_lock": threading.RLock(),
         "history_version": 0,
         "running": False,
         "attached_images": [],
@@ -1068,6 +1069,352 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         assert "warning" not in payload
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_rebinds_runtime_state_after_session_split(monkeypatch):
+    import tools.approval as _approval
+
+    class _Agent:
+        model = "x"
+
+        def __init__(self):
+            self.session_id = "old-session"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            self.session_id = "new-session"
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    created_workers: list[tuple[str, str]] = []
+    closed_workers: list[str] = []
+    worker_runs: list[tuple[str, str]] = []
+
+    class _FakeWorker:
+        def __init__(self, key, model):
+            self.session_key = key
+            self.model = model
+            created_workers.append((key, model))
+
+        def close(self):
+            closed_workers.append(self.session_key)
+
+        def run(self, command):
+            worker_runs.append((self.session_key, command))
+            return "slash ok"
+
+    registered: list[str] = []
+    unregistered: list[str] = []
+    complete_running_values: list[bool] = []
+    emits: list[tuple] = []
+    agent = _Agent()
+    old_worker = _FakeWorker("old-session", "x")
+    server._sessions["sid"] = _session(
+        agent=agent, session_key="old-session", slash_worker=old_worker
+    )
+
+    def _capture_emit(*args):
+        if args and args[0] == "message.complete":
+            complete_running_values.append(server._sessions["sid"]["running"])
+        emits.append(args)
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(server, "_emit", _capture_emit)
+        monkeypatch.setattr(
+            _approval, "register_gateway_notify", lambda key, cb: registered.append(key)
+        )
+        monkeypatch.setattr(
+            _approval, "unregister_gateway_notify", lambda key: unregistered.append(key)
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        assert server._sessions["sid"]["session_key"] == "new-session"
+        assert agent.session_id == "new-session"
+        assert ("new-session", "x") in created_workers
+        assert "old-session" in closed_workers
+        assert "old-session" in unregistered
+        assert "new-session" in registered
+        assert complete_running_values == [False]
+        assert any(call[0] == "session.info" for call in emits)
+
+        slash_resp = server.handle_request(
+            {
+                "id": "2",
+                "method": "slash.exec",
+                "params": {"session_id": "sid", "command": "status"},
+            }
+        )
+        assert slash_resp["result"]["output"] == "slash ok"
+        assert worker_runs[-1] == ("new-session", "status")
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_rebinds_runtime_state_during_mid_run_session_split(
+    monkeypatch,
+):
+    import tools.approval as _approval
+    from gateway.session_context import get_session_env
+    from tools.approval import get_current_session_key
+
+    observed: dict[str, object] = {}
+
+    class _Agent:
+        model = "x"
+
+        def __init__(self):
+            self.session_id = "old-session"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            self.session_id = "new-session"
+            callback = getattr(self, "session_split_callback", None)
+            observed["callback_installed"] = callback is not None
+            if callback is not None:
+                callback("old-session", "new-session", "compression")
+
+            worker = server._sessions["sid"]["slash_worker"]
+            observed["worker_session_key"] = worker.session_key
+            observed["approval_session_key"] = get_current_session_key(default="")
+            observed["context_session_key"] = get_session_env(
+                "HERMES_SESSION_KEY", ""
+            )
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    created_workers: list[str] = []
+    closed_workers: list[str] = []
+
+    class _FakeWorker:
+        def __init__(self, key, model):
+            self.session_key = key
+            created_workers.append(key)
+
+        def close(self):
+            closed_workers.append(self.session_key)
+
+    registered: list[str] = []
+    unregistered: list[str] = []
+    emits: list[tuple] = []
+    agent = _Agent()
+    server._sessions["sid"] = _session(
+        agent=agent,
+        session_key="old-session",
+        slash_worker=_FakeWorker("old-session", "x"),
+    )
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+        monkeypatch.setattr(
+            _approval, "register_gateway_notify", lambda key, cb: registered.append(key)
+        )
+        monkeypatch.setattr(
+            _approval, "unregister_gateway_notify", lambda key: unregistered.append(key)
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert observed["callback_installed"] is True
+        assert observed["worker_session_key"] == "new-session"
+        assert observed["approval_session_key"] == "new-session"
+        assert observed["context_session_key"] == "new-session"
+        assert server._sessions["sid"]["session_key"] == "new-session"
+        assert "old-session" in closed_workers
+        assert "new-session" in created_workers
+        assert "old-session" in unregistered
+        assert "new-session" in registered
+        assert any(call[0] == "session.info" for call in emits)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_does_not_rebind_when_session_id_is_unchanged(monkeypatch):
+    import tools.approval as _approval
+
+    class _Agent:
+        model = "x"
+        session_id = "same-session"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _ExistingWorker:
+        session_key = "same-session"
+
+        def close(self):
+            raise AssertionError("worker should not be closed without a split")
+
+    registered: list[str] = []
+    unregistered: list[str] = []
+    server._sessions["sid"] = _session(
+        agent=_Agent(), session_key="same-session", slash_worker=_ExistingWorker()
+    )
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(
+            server,
+            "_SlashWorker",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("worker should not restart without a split")
+            ),
+        )
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(server, "_emit", lambda *args: None)
+        monkeypatch.setattr(
+            _approval, "register_gateway_notify", lambda key, cb: registered.append(key)
+        )
+        monkeypatch.setattr(
+            _approval, "unregister_gateway_notify", lambda key: unregistered.append(key)
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert server._sessions["sid"]["session_key"] == "same-session"
+        assert registered == []
+        assert unregistered == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_compress_rebinds_runtime_state_after_session_split(monkeypatch):
+    import tools.approval as _approval
+
+    agent = types.SimpleNamespace(model="x", session_id="old-session")
+    created_workers: list[str] = []
+    closed_workers: list[str] = []
+
+    class _FakeWorker:
+        def __init__(self, key, model):
+            self.session_key = key
+            created_workers.append(key)
+
+        def close(self):
+            closed_workers.append(self.session_key)
+
+    registered: list[str] = []
+    unregistered: list[str] = []
+
+    def _fake_compress(session, focus_topic=None):
+        session["agent"].session_id = "new-session"
+        session["history"] = [{"role": "assistant", "content": "summary"}]
+        return 3, {"total": 7}
+
+    server._sessions["sid"] = _session(
+        agent=agent,
+        session_key="old-session",
+        slash_worker=_FakeWorker("old-session", "x"),
+        history=[{"role": "user", "content": "a"}] * 4,
+    )
+
+    try:
+        monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+        monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
+        monkeypatch.setattr(server, "_emit", lambda *args: None)
+        monkeypatch.setattr(
+            _approval, "register_gateway_notify", lambda key, cb: registered.append(key)
+        )
+        monkeypatch.setattr(
+            _approval, "unregister_gateway_notify", lambda key: unregistered.append(key)
+        )
+
+        resp = server.handle_request(
+            {"id": "1", "method": "session.compress", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["status"] == "compressed"
+        assert server._sessions["sid"]["session_key"] == "new-session"
+        assert "old-session" in closed_workers
+        assert "new-session" in created_workers
+        assert "old-session" in unregistered
+        assert "new-session" in registered
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_build_session_info_exposes_runtime_session_state(monkeypatch):
+    agent = types.SimpleNamespace(model="x", session_id="agent-session")
+    worker = types.SimpleNamespace(session_key="worker-session")
+    session = _session(
+        agent=agent,
+        session_key="backend-session",
+        slash_worker=worker,
+        running=True,
+    )
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "x"})
+
+    info = server._build_session_info(session)
+
+    assert info["runtime"]["session_key"] == "backend-session"
+    assert info["runtime"]["agent_session_id"] == "agent-session"
+    assert info["runtime"]["slash_worker_session_key"] == "worker-session"
+    assert info["runtime"]["running"] is True
 
 
 # ---------------------------------------------------------------------------

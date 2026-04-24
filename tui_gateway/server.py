@@ -172,6 +172,8 @@ class _SlashWorker:
     def __init__(self, session_key: str, model: str):
         self._lock = threading.Lock()
         self._seq = 0
+        self.session_key = session_key
+        self.model = model
         self.stderr_tail: list[str] = []
         self.stdout_queue: queue.Queue[dict | None] = queue.Queue()
 
@@ -671,6 +673,74 @@ def _restart_slash_worker(session: dict):
         )
     except Exception:
         session["slash_worker"] = None
+
+
+def _runtime_lock(session: dict):
+    lock = session.get("runtime_lock")
+    if lock is None:
+        lock = threading.RLock()
+        session["runtime_lock"] = lock
+    return lock
+
+
+def _runtime_session_info(session: dict) -> dict:
+    agent = session.get("agent")
+    worker = session.get("slash_worker")
+    return {
+        "session_key": session.get("session_key", ""),
+        "agent_session_id": getattr(agent, "session_id", "") or "",
+        "slash_worker_session_key": getattr(worker, "session_key", "") or "",
+        "running": bool(session.get("running")),
+    }
+
+
+def _build_session_info(session: dict) -> dict:
+    info = _session_info(session.get("agent"))
+    info["runtime"] = _runtime_session_info(session)
+    return info
+
+
+def _register_approval_notify(sid: str, session_key: str) -> None:
+    from tools.approval import register_gateway_notify
+
+    register_gateway_notify(
+        session_key, lambda data: _emit("approval.request", sid, data)
+    )
+
+
+def _sync_session_after_agent_run(
+    sid: str, session: dict, agent, *, reason: str
+) -> bool:
+    """Rebind TUI-owned runtime state after compression rotates agent.session_id."""
+    if not session:
+        return False
+    new_key = getattr(agent, "session_id", None)
+    if not new_key:
+        return False
+
+    with _runtime_lock(session):
+        old_key = session.get("session_key")
+        if new_key == old_key:
+            return False
+        session["session_key"] = new_key
+
+    logger.info("TUI session split detected: %s -> %s (%s)", old_key, new_key, reason)
+
+    if old_key:
+        try:
+            from tools.approval import unregister_gateway_notify
+
+            unregister_gateway_notify(old_key)
+        except Exception:
+            logger.warning("failed to unregister old TUI approval route %s", old_key)
+
+    try:
+        _register_approval_notify(sid, new_key)
+    except Exception:
+        logger.warning("failed to register new TUI approval route %s", new_key)
+
+    _restart_slash_worker(session)
+    return True
 
 
 def _persist_model_switch(result) -> None:
@@ -1332,6 +1402,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         "session_key": key,
         "history": history,
         "history_lock": threading.Lock(),
+        "runtime_lock": threading.RLock(),
         "history_version": 0,
         "running": False,
         "attached_images": [],
@@ -1710,6 +1781,12 @@ def _(rid, params: dict) -> dict:
     return err or _ok(rid, _get_usage(session["agent"]))
 
 
+@method("session.runtime")
+def _(rid, params: dict) -> dict:
+    session, err = _sess(params, rid)
+    return err or _ok(rid, _runtime_session_info(session))
+
+
 @method("session.history")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
@@ -1765,6 +1842,12 @@ def _(rid, params: dict) -> dict:
                 session, str(params.get("focus_topic", "") or "").strip()
             )
             messages = list(session.get("history", []))
+        _sync_session_after_agent_run(
+            params.get("session_id", ""),
+            session,
+            session["agent"],
+            reason="session.compress",
+        )
         info = _session_info(session["agent"])
         _emit("session.info", params.get("session_id", ""), info)
         return _ok(
@@ -2184,6 +2267,17 @@ def _(rid, params: dict) -> dict:
     def run():
         approval_token = None
         session_tokens = []
+        running_cleared = False
+        previous_session_split_callback = None
+
+        def _clear_running():
+            nonlocal running_cleared
+            if running_cleared:
+                return
+            with session["history_lock"]:
+                session["running"] = False
+                running_cleared = True
+
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -2192,6 +2286,51 @@ def _(rid, params: dict) -> dict:
 
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(session["session_key"])
+
+            previous_session_split_callback = getattr(
+                agent, "session_split_callback", None
+            )
+
+            def _refresh_runtime_context(new_key: str) -> None:
+                nonlocal approval_token, session_tokens
+                if approval_token is not None:
+                    try:
+                        reset_current_session_key(approval_token)
+                    except Exception:
+                        pass
+                    approval_token = None
+                approval_token = set_current_session_key(new_key)
+                _clear_session_context(session_tokens)
+                session_tokens = _set_session_context(new_key)
+
+            def _on_session_split(old_key: str, new_key: str, reason: str = "") -> None:
+                if new_key:
+                    _refresh_runtime_context(new_key)
+                session_rebound = _sync_session_after_agent_run(
+                    sid,
+                    session,
+                    agent,
+                    reason=f"prompt.submit.{reason or 'session_split'}",
+                )
+                if session_rebound:
+                    _emit("session.info", sid, _build_session_info(session))
+                if previous_session_split_callback:
+                    try:
+                        previous_session_split_callback(old_key, new_key, reason)
+                    except TypeError:
+                        try:
+                            previous_session_split_callback(old_key, new_key)
+                        except Exception:
+                            logger.debug(
+                                "previous session_split_callback error",
+                                exc_info=True,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "previous session_split_callback error", exc_info=True
+                        )
+
+            agent.session_split_callback = _on_session_split
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
@@ -2212,6 +2351,7 @@ def _(rid, params: dict) -> dict:
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    _clear_running()
                     _emit(
                         "error",
                         sid,
@@ -2278,6 +2418,9 @@ def _(rid, params: dict) -> dict:
                 raw = str(result)
                 status = "complete"
 
+            session_rebound = _sync_session_after_agent_run(
+                sid, session, agent, reason="prompt.submit"
+            )
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
@@ -2286,6 +2429,9 @@ def _(rid, params: dict) -> dict:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            if session_rebound:
+                _emit("session.info", sid, _build_session_info(session))
+            _clear_running()
             _emit("message.complete", sid, payload)
 
             # CLI parity: when voice-mode TTS is on, speak the agent reply
@@ -2326,16 +2472,26 @@ def _(rid, params: dict) -> dict:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            _clear_running()
             _emit("error", sid, {"message": str(e)})
         finally:
+            if previous_session_split_callback is None:
+                try:
+                    delattr(agent, "session_split_callback")
+                except Exception:
+                    pass
+            else:
+                try:
+                    agent.session_split_callback = previous_session_split_callback
+                except Exception:
+                    pass
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
             _clear_session_context(session_tokens)
-            with session["history_lock"]:
-                session["running"] = False
+            _clear_running()
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"status": "streaming"})
@@ -3785,6 +3941,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         elif name == "compress" and agent:
             with session["history_lock"]:
                 _compress_session_history(session, arg)
+            _sync_session_after_agent_run(
+                sid, session, agent, reason="slash.compress"
+            )
             _emit("session.info", sid, _session_info(agent))
         elif name == "fast" and agent:
             mode = arg.lower()

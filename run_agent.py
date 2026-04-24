@@ -789,6 +789,7 @@ class AIAgent:
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        session_split_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -994,6 +995,7 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
+        self.session_split_callback = session_split_callback
         self.tool_gen_callback = tool_gen_callback
 
         
@@ -7807,6 +7809,8 @@ class AIAgent:
         new_system_prompt = self._build_system_prompt(system_message)
         self._cached_system_prompt = new_system_prompt
 
+        split_old_session_id = None
+        split_new_session_id = None
         if self._session_db:
             try:
                 # Propagate title to the new session with auto-numbering
@@ -7816,6 +7820,8 @@ class AIAgent:
                 self._session_db.end_session(self.session_id, "compression")
                 old_session_id = self.session_id
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                split_old_session_id = old_session_id
+                split_new_session_id = self.session_id
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
                 self._session_db.create_session(
@@ -7836,6 +7842,23 @@ class AIAgent:
                 self._last_flushed_db_idx = 0
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+        if (
+            split_old_session_id
+            and split_new_session_id
+            and split_new_session_id != split_old_session_id
+        ):
+            callback = getattr(self, "session_split_callback", None)
+            if callback:
+                try:
+                    callback(split_old_session_id, split_new_session_id, "compression")
+                except TypeError:
+                    try:
+                        callback(split_old_session_id, split_new_session_id)
+                    except Exception:
+                        logger.debug("session_split_callback error", exc_info=True)
+                except Exception:
+                    logger.debug("session_split_callback error", exc_info=True)
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count

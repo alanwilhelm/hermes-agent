@@ -133,6 +133,48 @@ class TestFlushAfterCompression:
                 "(this test verifies the bug condition exists)"
             )
 
+    def test_compress_context_notifies_session_split_immediately(self):
+        """Compression must notify callers as soon as session_id rotates."""
+        from hermes_state import SessionDB
+
+        class _Compressor:
+            compression_count = 1
+            last_prompt_tokens = 0
+            last_completion_tokens = 0
+
+            def compress(self, messages, current_tokens=None, focus_topic=None):
+                return [{"role": "user", "content": "summary"}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            agent = self._make_agent(db)
+            agent.context_compressor = _Compressor()
+            agent.flush_memories = lambda *args, **kwargs: None
+            agent.commit_memory_session = lambda *args, **kwargs: None
+            agent._invalidate_system_prompt = lambda: None
+            agent._build_system_prompt = lambda _system_message=None: "system"
+
+            calls: list[tuple[str, str, str]] = []
+            agent.session_split_callback = (
+                lambda old, new, reason: calls.append((old, new, reason))
+            )
+
+            compressed, system_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system",
+                approx_tokens=100,
+            )
+
+            assert compressed == [{"role": "user", "content": "summary"}]
+            assert system_prompt == "system"
+            assert len(calls) == 1
+            old_session_id, new_session_id, reason = calls[0]
+            assert old_session_id == "original-session"
+            assert new_session_id == agent.session_id
+            assert reason == "compression"
+            assert db.get_session(new_session_id)["parent_session_id"] == old_session_id
+
 
 # ---------------------------------------------------------------------------
 # Part 2: Gateway-side — history_offset after session split
