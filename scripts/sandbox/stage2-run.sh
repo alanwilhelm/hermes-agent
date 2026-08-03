@@ -163,9 +163,43 @@ else
   etc_mounts+=(--bind "$DEV_SANDBOX_ROOT/etc" /etc)
 fi
 
+# /dev without a tty, so a script guarding on `[ -e /dev/tty ]` takes its
+# no-terminal path.
+#
+# bwrap's --dev creates a /dev/tty NODE, but nothing in here has a controlling
+# terminal, so opening it fails with "No such device or address". That is the
+# worst of both: the guard passes and the read then fails. Under `set -e` --
+# which install.sh uses -- a failed read inside a function aborts the whole
+# installer, which is exactly how older releases died here while prompting for
+# sudo to install ripgrep/ffmpeg.
+#
+# Making the tty real is not the fix: with an openable terminal that prompt
+# blocks forever waiting for input nobody will type. Absent is what a headless
+# machine looks like, and what every prompt in here should assume.
+#
+# --dev cannot be used with the node removed afterwards (bwrap refuses to mount
+# a directory over a device node), so /dev is assembled explicitly.
+dev_mounts=(
+  --tmpfs /dev
+  --dev-bind /dev/null /dev/null
+  --dev-bind /dev/zero /dev/zero
+  --dev-bind /dev/full /dev/full
+  --dev-bind /dev/random /dev/random
+  --dev-bind /dev/urandom /dev/urandom
+  --symlink /proc/self/fd /dev/fd
+  --symlink /proc/self/fd/0 /dev/stdin
+  --symlink /proc/self/fd/1 /dev/stdout
+  --symlink /proc/self/fd/2 /dev/stderr
+)
+if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
+  # An interactive shell is deliberately given a terminal; keep bwrap's /dev.
+  dev_mounts=(--dev /dev)
+fi
+
 exec bwrap \
   --unshare-pid \
-  --die-with-parent --proc /proc --dev /dev --tmpfs /tmp \
+  --die-with-parent --proc /proc --tmpfs /tmp \
+  "${dev_mounts[@]}" \
   "${gui_mounts[@]}" \
   "${runtime_mounts[@]}" \
   --bind "$DEV_SANDBOX_ROOT/root" /work \
