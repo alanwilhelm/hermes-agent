@@ -157,27 +157,23 @@ update_supports() {
   in_sandbox "hermes update --help 2>&1" | grep -qF -- "$flag"
 }
 
-# Read a file out of REF, fetching the ref on demand when it is not local.
-# Returns non-zero if it cannot be resolved, which callers treat as "flag absent"
-# -- a slower or more conservative invocation, never a wrong one.
-ref_file() {
-  local ref="$1"
-  local path="$2"
-  git show "$ref:$path" 2>/dev/null && return 0
-  git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
-  git show "FETCH_HEAD:$path" 2>/dev/null
-}
-
 # Does the installer at REF accept FLAG? Read it out of that ref's own
 # install.sh rather than assuming this checkout's flag set: the point of the
 # matrix is to install releases from months back, whose installers predate
-# options we take for granted. (Unlike the updater, the installer is fetched
-# before anything is installed, so there is nothing to ask --help yet.)
+# options we take for granted. (Unlike the updater, the installer runs before
+# anything is installed, so there is no --help to ask yet.)
+#
+# The ref may not be local -- the sandbox does its own fetching -- so fall back
+# to fetching just that blob. Unresolvable means "flag absent", which costs a
+# more conservative invocation, never a wrong one.
 installer_supports() {
   local ref="$1"
   local flag="$2"
   local script=""
-  script="$(ref_file "$ref" scripts/install.sh)" || return 1
+  script="$(git show "$ref:scripts/install.sh" 2>/dev/null)" || {
+    git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
+    script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
+  }
   printf '%s' "$script" | grep -qF -- "$flag"
 }
 

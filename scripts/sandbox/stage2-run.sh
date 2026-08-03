@@ -82,10 +82,17 @@ fi
 # sandbox's near-empty versions over them hides the real thing, and bwrap
 # dies with `execvp /usr/bin/bash: No such file or directory`. Keep the host
 # directories read-only and override only the individual files we shim.
+#
+# The same answer decides how /etc is handled further down.
+if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
+  USE_HOST_RUNTIME=false
+else
+  USE_HOST_RUNTIME=true
+fi
+
 runtime_mounts=()
 shim_mounts=()
-etc_mounts=()
-if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
+if [ "$USE_HOST_RUNTIME" = false ]; then
   runtime_mounts+=(--ro-bind /nix /nix)
   shim_mounts+=(
     --dir /usr
@@ -99,16 +106,61 @@ else
   for path in /usr /bin /sbin /lib /lib64; do
     [ -e "$path" ] && runtime_mounts+=(--ro-bind "$path" "$path")
   done
-  # Debian/Ubuntu route many binaries through the alternatives system:
-  # /usr/bin/awk is a symlink to /etc/alternatives/awk. The sandbox replaces
-  # /etc with its own, so without this those symlinks dangle and the payload
-  # sees "awk: not found" for a binary that is plainly on PATH. Bound after
-  # /etc below via etc_mounts.
-  [ -d /etc/alternatives ] \
-    && etc_mounts+=(--ro-bind /etc/alternatives /etc/alternatives)
   # The git-upload-pack shim standing in for github.com is the only file that
   # must beat the host's copy; sh/ls/env are already there for real.
   shim_mounts+=(--bind "$DEV_SANDBOX_ROOT/root/usr/bin/ssh" /usr/bin/ssh)
+fi
+
+# /etc: start from a copy of the host's and overwrite only the files we fake.
+#
+# Replacing the whole directory with a five-file one is the tempting shortcut
+# and it is wrong: a distro puts things under /etc that binaries outside /etc
+# depend on, so hiding all of it breaks tools that look fine on PATH. Two real
+# examples, both Debian/Ubuntu: openssl's compiled-in openssl.cnf is a symlink
+# into /etc/ssl, and /usr/bin/awk is a symlink to /etc/alternatives/awk -- with
+# /etc replaced, openssl cannot mint a certificate and awk reports "not found".
+# Those are two symptoms of one cause, and nothing says there are only two.
+#
+# Copying rather than mount-overlaying the individual files, because several of
+# these are symlinks in the wild (resolv.conf -> ../run/systemd/... on Ubuntu,
+# hosts and nsswitch.conf -> /etc/static/... on NixOS) and bwrap cannot bind a
+# file onto a symlink whose target does not exist inside the sandbox.
+#
+# Symlinks are copied as symlinks, never dereferenced: on NixOS /etc/static
+# points into the store and following it would copy gigabytes per sandbox. The
+# store is already mounted at /nix on that path, and the host runtime dirs are
+# mounted at their own paths, so absolute symlinks still resolve.
+#
+# The five we override, and why each must differ from the host's:
+#   passwd, group     the sandbox identity, which does not exist on the host
+#   resolv.conf       slirp4netns's DNS, not the host resolver
+#   nsswitch.conf     files+dns only, so nothing consults host NSS modules
+#   hosts             minimal, so no host entry leaks in
+#
+# os-release is removed rather than replaced. Installers branch on it to reach
+# for a package manager -- `install.sh` reads ID from it and, on debian/ubuntu,
+# offers to apt-get build tools, prompting on /dev/tty when sudo exists but is
+# not passwordless. That prompt cannot be satisfied here (no terminal) and it is
+# fatal under `set -e`. Inheriting the host's file would make the sandbox claim
+# to be a distro whose package manager it cannot actually use; absent means
+# DISTRO="unknown" and the apt path is skipped, which is the truth.
+etc_mounts=()
+if [ "$USE_HOST_RUNTIME" = true ] && [ -d /etc ]; then
+  sandbox_etc="$DEV_SANDBOX_ROOT/etc-merged"
+  rm -rf -- "$sandbox_etc"
+  mkdir -p "$sandbox_etc"
+  # -a keeps symlinks as symlinks; unreadable entries (shadow, sudoers) are
+  # skipped rather than failing the run.
+  cp -a /etc/. "$sandbox_etc/" 2>/dev/null || true
+  for etc_file in passwd group resolv.conf nsswitch.conf hosts; do
+    [ -f "$DEV_SANDBOX_ROOT/etc/$etc_file" ] || continue
+    rm -f "$sandbox_etc/$etc_file"
+    cp "$DEV_SANDBOX_ROOT/etc/$etc_file" "$sandbox_etc/$etc_file"
+  done
+  rm -f "$sandbox_etc/os-release" "$sandbox_etc/lsb-release"
+  etc_mounts+=(--ro-bind "$sandbox_etc" /etc)
+else
+  etc_mounts+=(--bind "$DEV_SANDBOX_ROOT/etc" /etc)
 fi
 
 exec bwrap \
@@ -120,7 +172,6 @@ exec bwrap \
   "${shim_mounts[@]}" \
   --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
   "${home_mounts[@]}" \
-  --bind "$DEV_SANDBOX_ROOT/etc" /etc \
   "${etc_mounts[@]}" \
   --chdir /work/repo \
   --clearenv \
